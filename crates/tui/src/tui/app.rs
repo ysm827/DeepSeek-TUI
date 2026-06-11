@@ -1450,6 +1450,16 @@ pub struct App {
     pub pending_subagent_dispatch: Option<String>,
     /// Animation anchor for status-strip active sub-agent spinner.
     pub agent_activity_started_at: Option<Instant>,
+    /// Monotonic counter for stable agent labels (#3030).
+    /// Incremented each time a sub-agent is spawned; used to generate
+    /// "Agent 1", "Agent 2", etc.
+    pub agent_counter: u64,
+    /// Maps raw agent_id to a stable user-facing label (#3030).
+    /// Populated when `AgentSpawned` fires; read by sidebar rendering.
+    pub agent_label_map: HashMap<String, String>,
+    /// Last time a sub-agent progress event triggered a redraw.
+    /// Used to throttle redraws under high sub-agent concurrency (#3033).
+    pub last_agent_progress_redraw: Option<Instant>,
     pub ui_theme: UiTheme,
     /// Active named theme. Drives the cell-level color remap in
     /// `tui::color_compat::ColorCompatBackend` so community presets
@@ -1633,6 +1643,9 @@ pub struct App {
     pub runtime_turn_id: Option<String>,
     /// Current runtime turn status (if known).
     pub runtime_turn_status: Option<String>,
+    /// Monotonic turn counter for stable user-facing labels (#3030).
+    /// Incremented each time a new turn starts; displayed as "Turn N".
+    pub turn_counter: u64,
     /// When the UI accepted a user message but has not observed `TurnStarted` yet.
     pub dispatch_started_at: Option<Instant>,
 
@@ -2179,6 +2192,9 @@ impl App {
             last_fanout_card_index: None,
             pending_subagent_dispatch: None,
             agent_activity_started_at: None,
+            agent_counter: 0,
+            agent_label_map: HashMap::new(),
+            last_agent_progress_redraw: None,
             ui_theme,
             theme_id,
             onboarding,
@@ -2267,6 +2283,7 @@ impl App {
             last_balance_fetch: None,
             runtime_turn_id: None,
             runtime_turn_status: None,
+            turn_counter: 0,
             dispatch_started_at: None,
             workspace_context: None,
             workspace_context_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -2730,6 +2747,28 @@ impl App {
             .filter_map(|idx| if idx >= n { Some(idx - n) } else { None })
             .collect();
         self.collapsed_cell_map.clear();
+    }
+
+    /// #3030: return the stable user-facing label for an agent id
+    /// ("Agent 3"), assigning the next sequential label on first sight.
+    pub(crate) fn ensure_agent_label(&mut self, agent_id: &str) -> String {
+        if let Some(label) = self.agent_label_map.get(agent_id) {
+            return label.clone();
+        }
+        self.agent_counter = self.agent_counter.saturating_add(1);
+        let label = format!("Agent {}", self.agent_counter);
+        self.agent_label_map
+            .insert(agent_id.to_string(), label.clone());
+        label
+    }
+
+    /// #3030: read-only label lookup with raw-id fallback for agents the
+    /// label map has never seen.
+    pub(crate) fn agent_display_label(&self, agent_id: &str) -> String {
+        self.agent_label_map
+            .get(agent_id)
+            .cloned()
+            .unwrap_or_else(|| agent_id.to_string())
     }
 
     pub fn mark_history_updated(&mut self) {

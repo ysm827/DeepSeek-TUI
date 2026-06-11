@@ -1489,6 +1489,12 @@ async fn spawn_duplicate_session_name_error_names_conflicting_agent() {
         msg.contains("running"),
         "includes the conflicting status: {msg}"
     );
+    // #3020: elapsed time lets the parent distinguish a live worker from a
+    // stale earlier spawn.
+    assert!(
+        msg.contains("started ") && msg.contains(" ago"),
+        "includes elapsed time since spawn: {msg}"
+    );
 }
 
 #[tokio::test]
@@ -2074,6 +2080,23 @@ fn annotate_child_model_error_adds_actionable_hint() {
 
     let unrelated = annotate_child_model_error("connection reset by peer", "kimi-k2");
     assert_eq!(unrelated, "connection reset by peer");
+
+    // #3020: provider rejections that classify as Internal (not
+    // Authorization/State) still get the hint via raw-text matching.
+    let not_exist = annotate_child_model_error("Model Not Exist", "kimi-k2");
+    assert!(
+        not_exist.contains("retry agent_open"),
+        "DeepSeek-style rejection gets the hint: {not_exist}"
+    );
+
+    let openai_style = annotate_child_model_error(
+        "The model `gpt-5.5-nano` does not exist or you do not have access to it.",
+        "gpt-5.5-nano",
+    );
+    assert!(
+        openai_style.contains("retry agent_open"),
+        "OpenAI-style rejection gets the hint: {openai_style}"
+    );
 }
 
 #[test]
@@ -3172,4 +3195,19 @@ fn model_catalog_only_advertises_canonical_subagent_tools() {
             "{legacy} should be hidden from the model-facing catalog"
         );
     }
+}
+
+// ── #3030: step-counter formatting ──────────────────────────────────────────
+
+#[test]
+fn format_step_counter_hides_unbounded_sentinel() {
+    // DEFAULT_MAX_STEPS is u32::MAX, meaning "unbounded" — rendering the
+    // sentinel as a denominator produced "step 16/4294967295".
+    assert_eq!(format_step_counter(16, u32::MAX), "step 16");
+}
+
+#[test]
+fn format_step_counter_keeps_concrete_budgets() {
+    assert_eq!(format_step_counter(3, 25), "step 3/25");
+    assert_eq!(format_step_counter(0, 1), "step 0/1");
 }

@@ -70,6 +70,18 @@ fn release_resident_leases_for(agent_id: &str) {
 /// the `SubAgentManager`.
 const DEFAULT_MAX_STEPS: u32 = u32::MAX;
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Format a step counter for sub-agent progress messages.
+///
+/// When `max_steps == u32::MAX` (the default), the denominator is a sentinel
+/// meaning "unbounded" — render just `step N` instead of `step N/4294967295`.
+fn format_step_counter(steps: u32, max_steps: u32) -> String {
+    if max_steps == u32::MAX {
+        format!("step {steps}")
+    } else {
+        format!("step {steps}/{max_steps}")
+    }
+}
 // Non-streaming sub-agents need enough response budget to carry large tool-call
 // arguments, especially write_file content. The API bills generated tokens, not
 // the requested ceiling.
@@ -1496,8 +1508,19 @@ impl SubAgentManager {
                 .values()
                 .find(|existing| existing.session_name == name)
             {
+                // #3020: Include elapsed time so the parent can distinguish a
+                // live worker from a stale/failed earlier spawn (#2656).
+                let elapsed = existing.started_at.elapsed();
+                let since = if elapsed.as_secs() < 120 {
+                    format!("{}s ago", elapsed.as_secs())
+                } else {
+                    let mins = elapsed.as_secs() / 60;
+                    let secs = elapsed.as_secs() % 60;
+                    format!("{mins}m{secs}s ago")
+                };
                 return Err(anyhow!(
-                    "Sub-agent session name '{name}' is already in use by agent_id '{}' (status: {}). \
+                    "Sub-agent session name '{name}' is already in use by agent_id '{}' \
+                     (status: {}, started {since}). \
                      Reuse that agent_id with agent_eval/agent_close, or open with a different name.",
                     existing.id,
                     subagent_status_name(&existing.status)
@@ -4158,7 +4181,7 @@ async fn run_subagent(
             record_agent_progress(
                 runtime,
                 &agent_id,
-                format!("step {steps}/{max_steps}: cancelled"),
+                format!("{}: cancelled", format_step_counter(steps, max_steps)),
             );
             if let Some(mb) = runtime.mailbox.as_ref() {
                 let _ = mb.send(MailboxMessage::Cancelled {
@@ -4210,7 +4233,10 @@ async fn run_subagent(
         record_agent_progress(
             runtime,
             &agent_id,
-            format!("step {steps}/{max_steps}: requesting model response"),
+            format!(
+                "{}: requesting model response",
+                format_step_counter(steps, max_steps)
+            ),
         );
 
         while let Ok(input) = input_rx.try_recv() {
@@ -4267,7 +4293,7 @@ async fn run_subagent(
                 record_agent_progress(
                     runtime,
                     &agent_id,
-                    format!("step {steps}/{max_steps}: cancelled mid-request"),
+                    format!("{}: cancelled mid-request", format_step_counter(steps, max_steps)),
                 );
                 if let Some(mb) = runtime.mailbox.as_ref() {
                     let _ = mb.send(MailboxMessage::Cancelled {
@@ -4330,7 +4356,7 @@ async fn run_subagent(
                         record_agent_progress(
                             runtime,
                             &agent_id,
-                            format!("step {steps}/{max_steps}: interrupted; {reason}"),
+                            format!("{}: interrupted; {reason}", format_step_counter(steps, max_steps)),
                         );
                         let status = SubAgentStatus::Interrupted(reason.clone());
                         let duration_ms =
@@ -4364,7 +4390,7 @@ async fn run_subagent(
                                 record_agent_progress(
                                     runtime,
                                     &agent_id,
-                                    format!("step {steps}/{max_steps}: cancelled while interrupted"),
+                                    format!("{}: cancelled while interrupted", format_step_counter(steps, max_steps)),
                                 );
                                 if let Some(mb) = runtime.mailbox.as_ref() {
                                     let _ = mb.send(MailboxMessage::Cancelled {
@@ -4488,7 +4514,7 @@ async fn run_subagent(
             record_agent_progress(
                 runtime,
                 &agent_id,
-                format!("step {steps}/{max_steps}: {progress}"),
+                format!("{}: {progress}", format_step_counter(steps, max_steps)),
             );
             messages.push(Message {
                 role: "user".to_string(),
@@ -4524,7 +4550,7 @@ async fn run_subagent(
                 record_agent_progress(
                     runtime,
                     &agent_id,
-                    format!("step {steps}/{max_steps}: complete"),
+                    format!("{}: complete", format_step_counter(steps, max_steps)),
                 );
                 break;
             }
@@ -4535,7 +4561,8 @@ async fn run_subagent(
             runtime,
             &agent_id,
             format!(
-                "step {steps}/{max_steps}: executing {} tool call(s)",
+                "{}: executing {} tool call(s)",
+                format_step_counter(steps, max_steps),
                 tool_uses.len()
             ),
         );
@@ -4544,7 +4571,10 @@ async fn run_subagent(
             record_agent_progress(
                 runtime,
                 &agent_id,
-                format!("step {steps}/{max_steps}: running tool '{tool_name}'"),
+                format!(
+                    "{}: running tool '{tool_name}'",
+                    format_step_counter(steps, max_steps)
+                ),
             );
             if let Some(mb) = runtime.mailbox.as_ref() {
                 let _ = mb.send(MailboxMessage::ToolCallStarted {
@@ -4568,7 +4598,10 @@ async fn run_subagent(
             record_agent_progress(
                 runtime,
                 &agent_id,
-                format!("step {steps}/{max_steps}: finished tool '{tool_name}'"),
+                format!(
+                    "{}: finished tool '{tool_name}'",
+                    format_step_counter(steps, max_steps)
+                ),
             );
             if let Some(mb) = runtime.mailbox.as_ref() {
                 let _ = mb.send(MailboxMessage::ToolCallCompleted {
@@ -5619,7 +5652,26 @@ fn annotate_child_model_error(err: &str, model: &str) -> String {
             "{err}\n(child model `{model}` may be unavailable under the current access profile — \
              retry agent_open with a different `model`, or remove `model` to inherit the parent's)"
         ),
-        _ => err.to_string(),
+        _ => {
+            // #3020 (#2653): Provider rejections like "Model Not Exist" or
+            // "does not exist or you do not have access" often classify as
+            // `Internal` rather than `Authorization`/`State`.  Catch these
+            // patterns in the raw error text and annotate anyway.
+            let lower = err.to_ascii_lowercase();
+            if lower.contains("model not exist")
+                || lower.contains("model_not_found")
+                || lower.contains("does not exist")
+                || lower.contains("no such model")
+                || lower.contains("invalid model")
+            {
+                format!(
+                    "{err}\n(child model `{model}` may be unavailable under the current access profile — \
+                     retry agent_open with a different `model`, or remove `model` to inherit the parent's)"
+                )
+            } else {
+                err.to_string()
+            }
+        }
     }
 }
 
