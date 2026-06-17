@@ -5,6 +5,7 @@
 //! all live here.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -586,6 +587,7 @@ impl<'a> PromptBuilder<'a> {
             ),
             false,
         );
+        dump_system_prompt_if_requested(&messages);
         if provider == ApiProvider::Arcee {
             apply_arcee_waf_safe_message_encoding(&mut messages);
         }
@@ -639,7 +641,44 @@ impl<'a> PromptBuilder<'a> {
     }
 }
 
+const SYSTEM_PROMPT_DUMP_ENV: &str = "CODEWHALE_DUMP_SYSTEM_PROMPT";
+const SYSTEM_PROMPT_DUMP_BEGIN: &str = "<<<CODEWHALE_SYSTEM_PROMPT_BEGIN>>>";
+const SYSTEM_PROMPT_DUMP_END: &str = "<<<CODEWHALE_SYSTEM_PROMPT_END>>>";
 const ARCEE_WAF_TEXT_SPLIT_TRIGGERS: &[(&str, &str, &str)] = &[("python -c", "python ", "-c")];
+
+fn dump_system_prompt_if_requested(messages: &[Value]) {
+    let Ok(flag) = std::env::var(SYSTEM_PROMPT_DUMP_ENV) else {
+        return;
+    };
+    if !matches!(flag.trim(), "1" | "true" | "TRUE" | "yes" | "YES") {
+        return;
+    }
+    let Some(prompt) = messages.iter().find_map(system_message_text) else {
+        return;
+    };
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "{SYSTEM_PROMPT_DUMP_BEGIN}");
+    let _ = writeln!(stderr, "{prompt}");
+    let _ = writeln!(stderr, "{SYSTEM_PROMPT_DUMP_END}");
+}
+
+fn system_message_text(message: &Value) -> Option<String> {
+    if message.get("role").and_then(Value::as_str) != Some("system") {
+        return None;
+    }
+    match message.get("content")? {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
 
 fn apply_arcee_waf_safe_message_encoding(messages: &mut [Value]) {
     for message in messages {
