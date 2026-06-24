@@ -11,11 +11,70 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
 
 jobs:
+  changes:
+    name: Change detection
+    runs-on: ubuntu-latest
+    outputs:
+      heavy: ${{ steps.detect.outputs.heavy }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Detect executable changes
+        id: detect
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${EVENT_NAME}" == "schedule" || "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            echo "heavy=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          base=""
+          if [[ "${EVENT_NAME}" == "pull_request" && -n "${BASE_REF}" ]]; then
+            git fetch --no-tags origin "${BASE_REF}:refs/remotes/origin/${BASE_REF}" --depth=1
+            base="origin/${BASE_REF}"
+          elif [[ -n "${BEFORE_SHA}" && "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
+            base="${BEFORE_SHA}"
+          fi
+
+          if [[ -z "${base}" ]]; then
+            echo "heavy=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          mapfile -t changed < <(git diff --name-only "${base}" "${GITHUB_SHA}" | sort)
+          heavy=false
+          for path in "${changed[@]}"; do
+            case "${path}" in
+              docs/*|*.md|.github/PULL_REQUEST_TEMPLATE.md|.github/ISSUE_TEMPLATE/*|.github/workflows/auto-tag.yml|.github/workflows/stale.yml|.github/workflows/triage.yml)
+                ;;
+              *)
+                heavy=true
+                ;;
+            esac
+          done
+
+          echo "heavy=${heavy}" >> "${GITHUB_OUTPUT}"
+
+          echo "Heavy Rust CI required: ${heavy}"
+          printf 'Changed files:\n'
+          printf '  %s\n' "${changed[@]}"
+
   versions:
     name: Version drift
     runs-on: ubuntu-latest
@@ -32,6 +91,8 @@ jobs:
 
   lint:
     name: Lint
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -49,6 +110,9 @@ jobs:
             sleep 15
           done
           sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run clippy
@@ -82,6 +146,8 @@ jobs:
 
   test:
     name: Test
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -112,7 +178,8 @@ jobs:
 
   npm-wrapper-smoke:
     name: npm wrapper smoke
-    if: github.event_name != 'schedule'
+    needs: changes
+    if: github.event_name != 'schedule' && needs.changes.outputs.heavy == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -142,7 +209,8 @@ jobs:
 
   mobile-smoke:
     name: Mobile runtime smoke
-    if: github.event_name != 'schedule'
+    needs: changes
+    if: github.event_name != 'schedule' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
