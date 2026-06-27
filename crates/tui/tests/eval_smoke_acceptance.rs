@@ -11,7 +11,7 @@
 //! commands/mod.rs.
 
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 
 use cucumber::{World as _, given, then, when, writer::Stats as _};
 use serde_json::Value;
@@ -28,6 +28,7 @@ const SMOKE_SCENARIO: &str = "Binary loads and reports step-level success via ev
 struct EvalSmokeWorld {
     _record_dir: Option<TempDir>,
     report: Option<Value>,
+    exit_status: Option<ExitStatus>,
 }
 
 #[given("a clean CodeWhale evaluation workspace")]
@@ -62,15 +63,42 @@ fn eval_harness_runs_shell_command(world: &mut EvalSmokeWorld) {
         panic!("eval --json should emit valid JSON: {err}\nstdout:\n{stdout}\nstderr:\n{stderr}")
     });
 
+    world.exit_status = Some(output.status);
     world.report = Some(report);
 }
 
 #[then("the binary exits successfully")]
 fn binary_exits_successfully(world: &mut EvalSmokeWorld) {
+    let status = world
+        .exit_status
+        .expect("exit status should have been captured");
+
+    // The eval harness exits with code 1 when `metrics.success` is false
+    // (run_eval in main.rs uses `bail!("...")` for non-successful scenarios).
+    // This is expected behavior: the eval runs a multi-step scenario offline
+    // (List, Read, Search, Edit, ApplyPatch, ExecShell) and the overall
+    // metrics.success reflects all steps, not just ExecShell. The ExecShell
+    // step itself succeeds — see `json_report_contains_execution_steps`.
+    //
+    // What we verify here:
+    //   1. The process ran to completion (was killed by no signal)
+    //   2. A known exit code was produced (not a crash/hang)
+    //   3. Step-level success is validated by the next Gherkin step.
+    let exit_code = status.code().expect("process should have terminated");
+    if cfg!(unix) {
+        use std::os::unix::process::ExitStatusExt;
+        assert!(
+            status.signal().is_none(),
+            "codewhale-tui eval was killed by signal {} (crash?)",
+            status.signal().unwrap()
+        );
+    }
+    assert!(
+        exit_code == 0 || exit_code == 1,
+        "codewhale-tui eval exited with unexpected code {exit_code} (expected 0 or 1)"
+    );
+
     let report = world.report.as_ref().expect("eval report should exist");
-    // The eval harness may report metrics.success as false (its own scoring),
-    // but the key assertion is that the binary ran and produced a valid report
-    // with executable shell steps that succeeded.
     let steps = report
         .get("steps")
         .and_then(|value| value.as_array())
