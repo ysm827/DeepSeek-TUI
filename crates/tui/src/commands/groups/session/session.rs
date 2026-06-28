@@ -872,6 +872,9 @@ mod tests {
         app.session.last_prompt_cache_miss_tokens = Some(40);
         app.session.last_reasoning_replay_tokens = Some(12);
         app.push_turn_cache_record(TurnCacheRecord {
+            provider: None,
+            model: None,
+            auto_model: false,
             input_tokens: 120,
             output_tokens: 35,
             cache_hit_tokens: Some(80),

@@ -712,10 +712,12 @@ fn format_cache_history(app: &App, count: usize, locale: Locale) -> String {
         .replace("{count}", &rows.len().to_string())
         .replace("{total}", &total.to_string())
         .replace("{model}", &app.model);
-    header.push_str(&"─".repeat(76));
+    header.push_str(&"─".repeat(96));
     header.push('\n');
-    header.push_str("turn   in    out   hit   miss   replay   ratio   age\n");
-    header.push_str(&"─".repeat(76));
+    header.push_str(
+        "turn  route                       in    out    hit   miss  replay   ratio   age\n",
+    );
+    header.push_str(&"─".repeat(96));
     header.push('\n');
 
     let now = Instant::now();
@@ -728,6 +730,7 @@ fn format_cache_history(app: &App, count: usize, locale: Locale) -> String {
         let replay_cell = rec
             .reasoning_replay_tokens
             .map_or_else(|| "—".to_string(), |t| t.to_string());
+        let route_cell = format_turn_cache_route(rec);
         let age = humanize_age(now.saturating_duration_since(rec.recorded_at));
 
         // No cache telemetry → render `—` everywhere and don't pollute totals
@@ -736,8 +739,9 @@ fn format_cache_history(app: &App, count: usize, locale: Locale) -> String {
         // would make every aggregate ratio look broken.
         let Some(hit) = rec.cache_hit_tokens else {
             body.push_str(&format!(
-                "{turn:>4}  {input:>5}  {output:>5}  {hit:>5}  {miss:>5}  {replay:>6}   {ratio:>6}   {age}\n",
+                "{turn:>4}  {route:<24}  {input:>5}  {output:>5}  {hit:>5}  {miss:>5}  {replay:>6}   {ratio:>6}   {age}\n",
                 turn = turn_index,
+                route = route_cell,
                 input = rec.input_tokens,
                 output = rec.output_tokens,
                 hit = "—",
@@ -766,8 +770,9 @@ fn format_cache_history(app: &App, count: usize, locale: Locale) -> String {
         };
 
         body.push_str(&format!(
-            "{turn:>4}  {input:>5}  {output:>5}  {hit:>5}  {miss:>5}  {replay:>6}   {ratio}   {age}\n",
+            "{turn:>4}  {route:<24}  {input:>5}  {output:>5}  {hit:>5}  {miss:>5}  {replay:>6}   {ratio}   {age}\n",
             turn = turn_index,
+            route = route_cell,
             input = rec.input_tokens,
             output = rec.output_tokens,
             hit = hit,
@@ -789,7 +794,7 @@ fn format_cache_history(app: &App, count: usize, locale: Locale) -> String {
     };
 
     let mut footer = String::new();
-    footer.push_str(&"─".repeat(76));
+    footer.push_str(&"─".repeat(96));
     footer.push('\n');
     footer.push_str(
         &tr(locale, MessageId::CmdCacheTotals)
@@ -802,6 +807,34 @@ fn format_cache_history(app: &App, count: usize, locale: Locale) -> String {
     footer.push_str(&tr(locale, MessageId::CmdCacheAdvice));
 
     format!("{header}{body}{footer}")
+}
+
+fn format_turn_cache_route(rec: &TurnCacheRecord) -> String {
+    let Some(model) = rec.model.as_deref().filter(|model| !model.is_empty()) else {
+        return "—".to_string();
+    };
+    let provider = rec
+        .provider
+        .map(|provider| provider.as_str())
+        .unwrap_or("?");
+    let route = if rec.auto_model {
+        format!("auto:{provider}/{model}")
+    } else {
+        format!("{provider}/{model}")
+    };
+    truncate_route_cell(&route, 24)
+}
+
+fn truncate_route_cell(route: &str, max_chars: usize) -> String {
+    if route.chars().count() <= max_chars {
+        return route.to_string();
+    }
+    if max_chars <= 3 {
+        return route.chars().take(max_chars).collect();
+    }
+    let mut out: String = route.chars().take(max_chars - 3).collect();
+    out.push_str("...");
+    out
 }
 
 fn humanize_age(d: std::time::Duration) -> String {
@@ -1331,6 +1364,9 @@ mod tests {
         let now = Instant::now();
         // Three turns: 75% hit, 50% hit, miss-only (provider didn't report hit).
         app.push_turn_cache_record(TurnCacheRecord {
+            provider: Some(crate::config::ApiProvider::Deepseek),
+            model: Some("deepseek-v4-pro".to_string()),
+            auto_model: true,
             input_tokens: 4_000,
             output_tokens: 200,
             cache_hit_tokens: Some(3_000),
@@ -1339,6 +1375,9 @@ mod tests {
             recorded_at: now,
         });
         app.push_turn_cache_record(TurnCacheRecord {
+            provider: None,
+            model: None,
+            auto_model: false,
             input_tokens: 6_000,
             output_tokens: 250,
             cache_hit_tokens: Some(3_000),
@@ -1349,6 +1388,9 @@ mod tests {
         // Turn 3: hit reported but provider didn't report miss separately —
         // infer miss = input − hit and mark with `*`.
         app.push_turn_cache_record(TurnCacheRecord {
+            provider: None,
+            model: None,
+            auto_model: false,
             input_tokens: 5_000,
             output_tokens: 100,
             cache_hit_tokens: Some(2_500),
@@ -1358,6 +1400,9 @@ mod tests {
         });
         // Turn 4: no telemetry at all — must not pollute aggregate ratios.
         app.push_turn_cache_record(TurnCacheRecord {
+            provider: None,
+            model: None,
+            auto_model: false,
             input_tokens: 1_000,
             output_tokens: 50,
             cache_hit_tokens: None,
@@ -1374,6 +1419,7 @@ mod tests {
         // Per-turn ratios are rendered.
         assert!(msg.contains("75.0%"), "got: {msg}");
         assert!(msg.contains("50.0%"), "got: {msg}");
+        assert!(msg.contains("auto:deepseek/deepsee..."), "got: {msg}");
         // Turn 3: hit=2500, inferred miss=2500 → 50.0% with `*`-marked miss.
         assert!(msg.contains("2500*"), "got: {msg}");
         // Turn 4 (no telemetry) shows em-dashes and is excluded from totals.
@@ -1397,6 +1443,9 @@ mod tests {
             (45_982, 294, 26_112, 19_870),
         ] {
             app.push_turn_cache_record(TurnCacheRecord {
+                provider: None,
+                model: None,
+                auto_model: false,
                 input_tokens: input,
                 output_tokens: output,
                 cache_hit_tokens: Some(hit),
@@ -1422,6 +1471,9 @@ mod tests {
         let mut app = create_test_app();
         for _ in 0..3 {
             app.push_turn_cache_record(TurnCacheRecord {
+                provider: None,
+                model: None,
+                auto_model: false,
                 input_tokens: 1_000,
                 output_tokens: 100,
                 cache_hit_tokens: Some(500),
@@ -1441,6 +1493,9 @@ mod tests {
         let mut app = create_test_app();
         for i in 0..(crate::tui::app::App::TURN_CACHE_HISTORY_CAP + 12) {
             app.push_turn_cache_record(TurnCacheRecord {
+                provider: None,
+                model: None,
+                auto_model: false,
                 input_tokens: i as u32,
                 output_tokens: 1,
                 cache_hit_tokens: Some(i as u32),
@@ -2117,6 +2172,9 @@ mod tests {
             Some("abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234".to_string());
 
         app.push_turn_cache_record(TurnCacheRecord {
+            provider: None,
+            model: None,
+            auto_model: false,
             input_tokens: 10_000,
             output_tokens: 1_000,
             cache_hit_tokens: Some(8_000),
@@ -2125,6 +2183,9 @@ mod tests {
             recorded_at: Instant::now(),
         });
         app.push_turn_cache_record(TurnCacheRecord {
+            provider: None,
+            model: None,
+            auto_model: false,
             input_tokens: 5_000,
             output_tokens: 500,
             cache_hit_tokens: Some(4_500),
@@ -2150,6 +2211,9 @@ mod tests {
             Some("abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234".to_string());
 
         app.push_turn_cache_record(TurnCacheRecord {
+            provider: None,
+            model: None,
+            auto_model: false,
             input_tokens: 10_000,
             output_tokens: 1_000,
             cache_hit_tokens: Some(1_000),
@@ -2180,6 +2244,9 @@ mod tests {
         // Fixture from #1747 / Amund's DeepSeek-TUI session aggregate:
         // hit=21,356,928, miss=8,470,281, output=165,624.
         app.push_turn_cache_record(TurnCacheRecord {
+            provider: None,
+            model: None,
+            auto_model: false,
             input_tokens: 29_827_209,
             output_tokens: 165_624,
             cache_hit_tokens: Some(21_356_928),

@@ -2259,6 +2259,7 @@ async fn run_event_loop(
                         tool_catalog,
                         base_url,
                     } => {
+                        let pending_turn_route = app.pending_turn_route.take();
                         app.session.last_tool_catalog = tool_catalog;
                         app.session.last_base_url = base_url;
                         let was_locally_cancelled = app.suppress_stream_events_until_turn_complete;
@@ -2374,7 +2375,15 @@ async fn run_event_loop(
                         app.session.last_prompt_cache_hit_tokens = usage.prompt_cache_hit_tokens;
                         app.session.last_prompt_cache_miss_tokens = usage.prompt_cache_miss_tokens;
                         app.session.last_reasoning_replay_tokens = usage.reasoning_replay_tokens;
+                        let (provider, model, auto_model) = pending_turn_route
+                            .map(|(provider, model, auto_model)| {
+                                (Some(provider), Some(model), auto_model)
+                            })
+                            .unwrap_or((None, None, false));
                         app.push_turn_cache_record(crate::tui::app::TurnCacheRecord {
+                            provider,
+                            model,
+                            auto_model,
                             input_tokens: usage.input_tokens,
                             output_tokens: usage.output_tokens,
                             cache_hit_tokens: usage.prompt_cache_hit_tokens,
@@ -6411,6 +6420,7 @@ async fn dispatch_user_message(
         app.last_effective_model = None;
     }
 
+    app.pending_turn_route = Some((effective_provider, effective_model.clone(), app.auto_model));
     if let Err(err) = engine_handle
         .send(Op::SendMessage {
             content,
@@ -6440,6 +6450,7 @@ async fn dispatch_user_message(
         app.is_loading = false;
         app.dispatch_started_at = None;
         app.last_send_at = None;
+        app.pending_turn_route = None;
         return Err(err);
     }
 

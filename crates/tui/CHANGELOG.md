@@ -55,6 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Added provider/model route columns to `/cache` turn telemetry so DeepSeek
+  cache-hit regressions can be correlated with Auto route changes (#3738).
 - Fixed runtime API approval handling so workspace trust no longer auto-resolves
   ordinary tool approvals; trust now only participates in full-access retry
   decisions while YOLO/auto-approve remains the approval bypass (#3736).

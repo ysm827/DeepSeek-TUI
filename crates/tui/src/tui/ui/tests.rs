@@ -2168,6 +2168,9 @@ fn apply_loaded_session_resets_unpersisted_telemetry() {
     app.session.last_prompt_cache_miss_tokens = Some(40);
     app.session.last_reasoning_replay_tokens = Some(12);
     app.push_turn_cache_record(crate::tui::app::TurnCacheRecord {
+        provider: None,
+        model: None,
+        auto_model: false,
         input_tokens: 120,
         output_tokens: 35,
         cache_hit_tokens: Some(80),
@@ -2780,6 +2783,9 @@ async fn provider_switch_clears_turn_cache_history() {
 
     let mut app = create_test_app();
     app.push_turn_cache_record(crate::tui::app::TurnCacheRecord {
+        provider: None,
+        model: None,
+        auto_model: false,
         input_tokens: 100,
         output_tokens: 25,
         cache_hit_tokens: Some(70),
@@ -3232,6 +3238,10 @@ async fn dispatch_user_message_failed_send_clears_loading_state() {
     );
     assert!(app.last_send_at.is_none());
     assert!(app.dispatch_started_at.is_none());
+    assert!(
+        app.pending_turn_route.is_none(),
+        "failed dispatch must not leave stale route telemetry"
+    );
 }
 
 #[cfg(not(windows))]
@@ -3580,6 +3590,14 @@ async fn dispatch_user_message_keeps_auto_review_separate_from_bypass() {
     )
     .await
     .expect("dispatch user message");
+
+    let pending_route = app
+        .pending_turn_route
+        .as_ref()
+        .expect("successful dispatch records route telemetry");
+    assert_eq!(pending_route.0, app.api_provider);
+    assert_eq!(pending_route.1, app.model);
+    assert!(!pending_route.2);
 
     match engine.rx_op.recv().await.expect("send message op") {
         crate::core::ops::Op::SendMessage {
