@@ -115,7 +115,7 @@ function deriveProvidersFromConfig(cfg: string): ProviderFact[] {
   if (unmapped.length > 0) {
     console.warn(
       `[facts-drift] ApiProvider variants missing from labelMap: ${unmapped.join(", ")}. ` +
-        "Add them to labelMap here AND in web/scripts/derive-facts.mjs (or to EXCLUDED if intentionally hidden).",
+        "Add them to labelMap here AND PROVIDER_LABEL_MAP in web/scripts/facts-lib.mjs (or to EXCLUDED if intentionally hidden).",
     );
   }
   return variants.map((v) => labelMap[v]).filter(Boolean);
