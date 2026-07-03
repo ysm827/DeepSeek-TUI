@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Raised the streamed model-response idle timeout and matched the TUI stall
   watchdog to the configured stream budget so long reasoning pauses are not
-  recovered as stalled turns.
+  recovered as stalled turns (#2487).
 
 ### Removed
 
