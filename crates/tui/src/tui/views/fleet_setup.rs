@@ -1068,7 +1068,10 @@ mod tests {
             40,
         )
         .join("\n");
-        assert!(role_step.contains("Overrides the built-in 'reviewer'"), "{role_step}");
+        assert!(
+            role_step.contains("Overrides the built-in 'reviewer'"),
+            "{role_step}"
+        );
 
         let review = render_through_stack(
             || {
@@ -1083,7 +1086,10 @@ mod tests {
             40,
         )
         .join("\n");
-        assert!(review.contains("Overrides the built-in 'reviewer'"), "{review}");
+        assert!(
+            review.contains("Overrides the built-in 'reviewer'"),
+            "{review}"
+        );
 
         // "main" matches no roster member: no override note anywhere.
         let mut main_view = FleetSetupView::from_snapshot(snapshot());

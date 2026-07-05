@@ -5712,19 +5712,19 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         .transpose()?;
     let model_strength_explicit = explicit_model_strength.is_some();
     let model_strength = explicit_model_strength.unwrap_or_else(|| {
-            // Default model strength. `type: "explore"` defaults to Faster for
-            // bounded read-only lookup/search/status work — the cheap, fast
-            // same-family sibling is exactly the lossy-breadth job a child
-            // should run. Every other role (and any call that supplies an
-            // explicit `model`) stays conservative at Same. Explicit
-            // model_strength above already wins via .parse(); explicit `model`
-            // wins downstream in assignment_model_route regardless of strength.
-            if agent_type == SubAgentType::Explore && model.is_none() {
-                SubAgentModelStrength::Faster
-            } else {
-                SubAgentModelStrength::Same
-            }
-        });
+        // Default model strength. `type: "explore"` defaults to Faster for
+        // bounded read-only lookup/search/status work — the cheap, fast
+        // same-family sibling is exactly the lossy-breadth job a child
+        // should run. Every other role (and any call that supplies an
+        // explicit `model`) stays conservative at Same. Explicit
+        // model_strength above already wins via .parse(); explicit `model`
+        // wins downstream in assignment_model_route regardless of strength.
+        if agent_type == SubAgentType::Explore && model.is_none() {
+            SubAgentModelStrength::Faster
+        } else {
+            SubAgentModelStrength::Same
+        }
+    });
     let thinking = optional_input_str(input, &["thinking", "reasoning_effort", "reasoningEffort"])
         .map(SubAgentThinking::parse)
         .transpose()?

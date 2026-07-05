@@ -370,7 +370,10 @@ fn search_file_streaming(
             matches[*idx].context_after.push(line.to_string());
             *remaining -= 1;
         }
-        while pending.front().is_some_and(|(_, remaining)| *remaining == 0) {
+        while pending
+            .front()
+            .is_some_and(|(_, remaining)| *remaining == 0)
+        {
             pending.pop_front();
         }
 

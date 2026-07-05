@@ -23,9 +23,9 @@ impl RegisterCommand for FleetCmd {
     fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
         match arg.map(str::trim).filter(|arg| !arg.is_empty()) {
             None
-            | Some(
-                "roster" | "party" | "loadout" | "roles" | "role" | "profiles" | "profile",
-            ) => CommandResult::action(AppAction::OpenFleetRoster),
+            | Some("roster" | "party" | "loadout" | "roles" | "role" | "profiles" | "profile") => {
+                CommandResult::action(AppAction::OpenFleetRoster)
+            }
             Some("setup" | "edit" | "new") => CommandResult::action(AppAction::OpenFleetSetup),
             Some("status" | "workers" | "worker" | "agents" | "subagents" | "list") => {
                 super::core::subagents(app)

@@ -217,9 +217,9 @@ fn trailing_marker_prefix_len(text: &str, markers: &[&str]) -> usize {
                 .filter(|idx| *idx > 0)
                 .chain(std::iter::once(marker.len()))
                 .filter(|idx| *idx < marker.len())
-                .filter_map(|idx| {
-                    let prefix = &marker[..idx];
-                    text.ends_with(prefix).then_some(idx)
+                .filter(|idx| {
+                    let prefix = &marker[..*idx];
+                    text.ends_with(prefix)
                 })
         })
         .max()
@@ -236,9 +236,9 @@ fn trailing_start_marker_prefix_len(text: &str) -> usize {
                 .filter(|idx| *idx > 0)
                 .chain(std::iter::once(marker.len()))
                 .filter(|idx| *idx < marker.len())
-                .filter_map(|idx| {
-                    let prefix = &marker[..idx];
-                    text.ends_with(prefix).then_some(idx)
+                .filter(|idx| {
+                    let prefix = &marker[..*idx];
+                    text.ends_with(prefix)
                 })
         })
         .max()

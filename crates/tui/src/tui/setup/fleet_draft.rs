@@ -42,7 +42,11 @@ pub(crate) const WORKSPACE_FINGERPRINT_MAX_CHARS: usize = 1000;
 /// workspace-controlled can leak through them.
 const MANIFEST_PROBES: &[(&str, Option<&str>, Option<&str>)] = &[
     ("Cargo.toml", Some("rust"), Some("cargo test")),
-    ("package.json", Some("javascript/typescript"), Some("npm test")),
+    (
+        "package.json",
+        Some("javascript/typescript"),
+        Some("npm test"),
+    ),
     ("pyproject.toml", Some("python"), Some("pytest")),
     ("requirements.txt", Some("python"), None),
     ("go.mod", Some("go"), Some("go test")),
@@ -127,8 +131,12 @@ pub(crate) fn workspace_fingerprint(workspace: &Path) -> String {
     let branch = git_stdout(workspace, &["rev-parse", "--abbrev-ref", "HEAD"])
         .map(|branch| sanitize_branch_name(&branch))
         .filter(|branch| !branch.is_empty());
-    let dirty = git_stdout(workspace, &["status", "--porcelain"])
-        .map(|status| status.lines().filter(|line| !line.trim().is_empty()).count());
+    let dirty = git_stdout(workspace, &["status", "--porcelain"]).map(|status| {
+        status
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count()
+    });
     match (branch, dirty) {
         (Some(branch), Some(dirty)) => {
             sections.push(format!("repo: branch {branch}, {dirty} dirty files"));
@@ -480,10 +488,16 @@ mod tests {
             r#"{"id":"rogue","role_hint":"reviewer","description":"x","permissions":{"allow_shell":true}}"#,
         ));
 
-        let err =
-            draft_fleet_profile_with_model(&mock, "mock-model", "reviewer", "cheap", Locale::En, "")
-                .await
-                .expect_err("permission smuggling must fail the parse");
+        let err = draft_fleet_profile_with_model(
+            &mock,
+            "mock-model",
+            "reviewer",
+            "cheap",
+            Locale::En,
+            "",
+        )
+        .await
+        .expect_err("permission smuggling must fail the parse");
         assert!(err.contains("not a valid profile"), "{err}");
     }
 
@@ -492,10 +506,16 @@ mod tests {
         let mock = MockLlmClient::new(Vec::new());
         mock.push_message_response(text_response("I would rather chat about whales."));
 
-        let err =
-            draft_fleet_profile_with_model(&mock, "mock-model", "reviewer", "cheap", Locale::En, "")
-                .await
-                .expect_err("prose without JSON must be rejected");
+        let err = draft_fleet_profile_with_model(
+            &mock,
+            "mock-model",
+            "reviewer",
+            "cheap",
+            Locale::En,
+            "",
+        )
+        .await
+        .expect_err("prose without JSON must be rejected");
         assert!(err.contains("not a valid profile"), "{err}");
     }
 
@@ -515,10 +535,16 @@ mod tests {
         );
         mock.push_message_response(response);
 
-        let draft =
-            draft_fleet_profile_with_model(&mock, "mock-model", "reviewer", "cheap", Locale::En, "")
-                .await
-                .expect("text block should parse");
+        let draft = draft_fleet_profile_with_model(
+            &mock,
+            "mock-model",
+            "reviewer",
+            "cheap",
+            Locale::En,
+            "",
+        )
+        .await
+        .expect("text block should parse");
         assert_eq!(draft.id, "real");
     }
 }

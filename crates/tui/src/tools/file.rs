@@ -184,7 +184,11 @@ impl ToolSpec for ReadFileTool {
         }
 
         Ok(render_line_window(
-            path_str, &window, total_lines, start_line, max_lines,
+            path_str,
+            &window,
+            total_lines,
+            start_line,
+            max_lines,
         ))
     }
 }
@@ -1467,7 +1471,10 @@ mod tests {
         fs::write(&file, &bytes).expect("write");
 
         let err = ReadFileTool
-            .execute(json!({ "path": "mixed.bin", "start_line": 1, "max_lines": 2 }), &ctx)
+            .execute(
+                json!({ "path": "mixed.bin", "start_line": 1, "max_lines": 2 }),
+                &ctx,
+            )
             .await
             .expect_err("invalid UTF-8 must error");
         let message = err.to_string();

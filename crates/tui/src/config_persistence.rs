@@ -69,7 +69,10 @@ pub(crate) fn write_config_toml_atomic(path: &Path, body: &str) -> anyhow::Resul
             .as_file()
             .set_permissions(fs::Permissions::from_mode(0o600))
             .with_context(|| {
-                format!("failed to secure temporary config file for {}", path.display())
+                format!(
+                    "failed to secure temporary config file for {}",
+                    path.display()
+                )
             })?;
     }
     temporary
@@ -1106,7 +1109,10 @@ action = "mode.plan"
         let model_at = body.find("model = ").unwrap();
         let projects_at = body.find("[projects.").unwrap();
         let providers_at = body.find("[providers.openrouter]").unwrap();
-        assert!(model_at < projects_at && projects_at < providers_at, "{body}");
+        assert!(
+            model_at < projects_at && projects_at < providers_at,
+            "{body}"
+        );
 
         let parsed: toml::Value = toml::from_str(&body).unwrap();
         assert_eq!(
@@ -1147,8 +1153,10 @@ action = "mode.plan"
         let path = temp_root.join(".deepseek").join("config.toml");
         write_golden_config(&path);
 
-        mutate_config_document(&path, |doc| set_document_value(doc, &["api_key"], "sk-fresh"))
-            .expect("mutation should succeed");
+        mutate_config_document(&path, |doc| {
+            set_document_value(doc, &["api_key"], "sk-fresh")
+        })
+        .expect("mutation should succeed");
 
         let body = fs::read_to_string(&path).unwrap();
         assert!(
@@ -1226,8 +1234,14 @@ slot = 1
             Some("ACME_API_KEY"),
         )
         .expect("first persist should succeed");
-        persist_custom_provider(Some(&path), "acme_ai", "https://api.acme.example/v2", None, None)
-            .expect("second persist should succeed");
+        persist_custom_provider(
+            Some(&path),
+            "acme_ai",
+            "https://api.acme.example/v2",
+            None,
+            None,
+        )
+        .expect("second persist should succeed");
 
         let body = fs::read_to_string(&path).unwrap();
         let parsed: toml::Value = toml::from_str(&body).unwrap();

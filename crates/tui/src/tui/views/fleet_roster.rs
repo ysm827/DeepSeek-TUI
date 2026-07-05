@@ -341,11 +341,7 @@ fn operator_detail_lines(operator: &OperatorInfo) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     detail_field(&mut lines, "Member", "operator (session route)".to_string());
     detail_field(&mut lines, "Origin", "session".to_string());
-    detail_field(
-        &mut lines,
-        "Posture",
-        "full session authority".to_string(),
-    );
+    detail_field(&mut lines, "Posture", "full session authority".to_string());
     detail_field(&mut lines, "Provider", operator.provider.clone());
     detail_field(&mut lines, "Model", operator.model.clone());
     detail_field(&mut lines, "Reasoning", operator.reasoning.clone());
@@ -415,11 +411,7 @@ fn member_detail_lines(member: &AgentProfile) -> Vec<Line<'static>> {
             _ => format!("{} · {}", member.origin, member.source.display()),
         },
     );
-    detail_field(
-        &mut lines,
-        "Slot",
-        member.profile.slot.as_str().to_string(),
-    );
+    detail_field(&mut lines, "Slot", member.profile.slot.as_str().to_string());
     detail_field(&mut lines, "Posture", member_posture(member));
     detail_field(&mut lines, "Routing", member_routing(member));
 
@@ -714,8 +706,7 @@ mod tests {
             profiles,
             ..codewhale_config::FleetConfigToml::default()
         };
-        let view =
-            FleetRosterView::from_parts(operator(), FleetRoster::load(&config, tmp.path()));
+        let view = FleetRosterView::from_parts(operator(), FleetRoster::load(&config, tmp.path()));
         let extra = view.members.iter().find(|m| m.id == "docs-writer").unwrap();
         assert_eq!(extra.origin, ProfileOrigin::Config);
         assert_eq!(member_routing(extra), "loadout fast");

@@ -1181,7 +1181,13 @@ fn test_parse_spawn_request_accepts_profile_and_normalizes() {
 
 #[test]
 fn test_parse_spawn_request_rejects_invalid_profile_token() {
-    for bad in ["rev iewer", "rev\"iewer", "rev'iewer", "rev`iewer", "rev=er"] {
+    for bad in [
+        "rev iewer",
+        "rev\"iewer",
+        "rev'iewer",
+        "rev`iewer",
+        "rev=er",
+    ] {
         let err = parse_spawn_request(&json!({"prompt": "x", "profile": bad}))
             .expect_err("invalid profile token should fail");
         assert!(
@@ -1350,7 +1356,12 @@ fn test_child_max_spawn_depth_profile_hint_only_narrows() {
     // Explicit request alone keeps its existing widen-up-to-ceiling semantics.
     assert_eq!(child_max_spawn_depth_for_spawn(2, 0, Some(3), None), 3);
     assert_eq!(
-        child_max_spawn_depth_for_spawn(2, 0, Some(codewhale_config::MAX_SPAWN_DEPTH_CEILING), None),
+        child_max_spawn_depth_for_spawn(
+            2,
+            0,
+            Some(codewhale_config::MAX_SPAWN_DEPTH_CEILING),
+            None
+        ),
         codewhale_config::MAX_SPAWN_DEPTH_CEILING
     );
     // Neither request nor hint: inherit unchanged.
