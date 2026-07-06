@@ -66,5 +66,7 @@ mimalloc = { version = "0.1", default-features = false }
 [profile.release]
 lto = true
 strip = true
-panic = "abort"
+# NOTE: no `panic = "abort"` here — the TUI's panic supervision
+# (catch_unwind/spawn_supervised) needs unwinding so one panicking tool call
+# or task fails gracefully instead of aborting the whole session.
 codegen-units = 1
