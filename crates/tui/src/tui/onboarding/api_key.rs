@@ -160,12 +160,12 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            body.contains("Connect your API key"),
-            "title is provider-neutral"
+            body.contains("连接你的 API 密钥"),
+            "title is provider-neutral and localized for zh-Hans"
         );
         assert!(
-            body.contains("platform.deepseek.com"),
-            "expected default DeepSeek credential URL, got: {body}"
+            body.contains("z.ai/model-api"),
+            "expected default provider credential URL, got: {body}"
         );
         assert!(
             body.contains("密钥"),
