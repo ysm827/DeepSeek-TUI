@@ -4240,7 +4240,12 @@ async fn run_subagent_task(task: SubAgentTask) {
                 "sub-agent {} model request failed: {err:#}",
                 task.agent_id
             ));
-            let annotated = annotate_child_model_error(&subagent_failure_message(err), &model_id);
+            let annotated = annotate_child_model_error(
+                &subagent_failure_message(err),
+                &model_id,
+                task.runtime.client.api_provider(),
+                &task.runtime.worker_profile.model,
+            );
             (
                 format!("Failed: {annotated}"),
                 subagent_failed_sentinel(&task.agent_id, &annotated),
@@ -4256,7 +4261,12 @@ async fn run_subagent_task(task: SubAgentTask) {
             },
             Err(err) => MailboxMessage::Failed {
                 agent_id: task.agent_id.clone(),
-                error: annotate_child_model_error(&subagent_failure_message(err), &model_id),
+                error: annotate_child_model_error(
+                    &subagent_failure_message(err),
+                    &model_id,
+                    task.runtime.client.api_provider(),
+                    &task.runtime.worker_profile.model,
+                ),
             },
         };
         let _ = mb.send(envelope);
@@ -4278,7 +4288,12 @@ async fn run_subagent_task(task: SubAgentTask) {
         Err(err) => {
             manager.update_failed(
                 &agent_id,
-                annotate_child_model_error(&subagent_failure_message(err), &model_id),
+                annotate_child_model_error(
+                    &subagent_failure_message(err),
+                    &model_id,
+                    task.runtime.client.api_provider(),
+                    &task.runtime.worker_profile.model,
+                ),
             );
         }
     }
@@ -6072,13 +6087,11 @@ pub(crate) fn normalize_requested_subagent_model(
 }
 
 fn provider_name_for_error(provider: crate::config::ApiProvider) -> &'static str {
-    match provider {
-        crate::config::ApiProvider::Deepseek | crate::config::ApiProvider::DeepseekCN => "DeepSeek",
-        crate::config::ApiProvider::Openai | crate::config::ApiProvider::OpenaiCodex => "OpenAI",
-        crate::config::ApiProvider::Moonshot => "Moonshot",
-        crate::config::ApiProvider::Ollama => "Ollama",
-        _ => "this provider",
-    }
+    // Reuse the canonical picker/status label so every provider is named
+    // concretely (DeepSeek, Sakana, Zhipu, …) instead of collapsing the long
+    // tail to "this provider", and so error copy stays in sync with the model
+    // picker labels (#4049).
+    provider.display_name()
 }
 
 pub(crate) fn configured_model_for_role_or_type(
@@ -7138,17 +7151,42 @@ fn subagent_failure_message(err: &anyhow::Error) -> String {
     }
 }
 
+/// Human label for how a child's model was selected, so a launch failure can
+/// name the route that produced the failing model — inherited from the parent,
+/// a faster same-family sibling, or an explicit id (#4049).
+fn route_source_label(route: &ModelRoute) -> String {
+    match route {
+        ModelRoute::Inherit => "inherited from the parent/session model".to_string(),
+        ModelRoute::Faster => "faster same-family sibling of the parent model".to_string(),
+        ModelRoute::Auto => "auto (legacy route, treated as a faster sibling)".to_string(),
+        ModelRoute::Fixed(id) => format!("explicit model id `{id}`"),
+    }
+}
+
 /// When a child agent fails because its model is unavailable under the current
 /// access profile, a bare provider 403/404 (classified `Authorization` or
-/// `State`) is unactionable. Annotate it so the parent knows the likely cause
-/// and how to recover (#2653) without re-classifying the underlying error.
-fn annotate_child_model_error(err: &str, model: &str) -> String {
+/// `State`) is unactionable. Annotate it so the parent knows which provider and
+/// route produced the failing model and how to recover (#2653, #4049) without
+/// re-classifying the underlying error. Errors unrelated to model availability
+/// pass through unchanged.
+fn annotate_child_model_error(
+    err: &str,
+    model: &str,
+    provider: crate::config::ApiProvider,
+    route: &ModelRoute,
+) -> String {
+    let hint = || {
+        format!(
+            "{err}\n(provider `{}` · requested model `{model}` · route: {} — \
+             the model may be unavailable under the current access profile; remove the explicit \
+             child model override or adjust child-agent model config before retrying)",
+            provider_name_for_error(provider),
+            route_source_label(route),
+        )
+    };
     match crate::error_taxonomy::classify_error_message(err) {
         crate::error_taxonomy::ErrorCategory::Authorization
-        | crate::error_taxonomy::ErrorCategory::State => format!(
-            "{err}\n(child model `{model}` may be unavailable under the current access profile — \
-             remove the explicit child model override or adjust child-agent model config before retrying)"
-        ),
+        | crate::error_taxonomy::ErrorCategory::State => hint(),
         _ => {
             // #3020 (#2653): Provider rejections like "Model Not Exist" or
             // "does not exist or you do not have access" often classify as
@@ -7161,10 +7199,7 @@ fn annotate_child_model_error(err: &str, model: &str) -> String {
                 || lower.contains("no such model")
                 || lower.contains("invalid model")
             {
-                format!(
-                    "{err}\n(child model `{model}` may be unavailable under the current access profile — \
-                     remove the explicit child model override or adjust child-agent model config before retrying)"
-                )
+                hint()
             } else {
                 err.to_string()
             }

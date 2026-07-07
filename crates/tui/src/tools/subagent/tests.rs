@@ -3761,7 +3761,14 @@ fn annotated_failure_message_composes_class_tag_and_model_hint() {
     ))
     .context("Responses API request failed");
 
-    let annotated = annotate_child_model_error(&subagent_failure_message(&err), "gpt-5.5-codex");
+    let provider = crate::config::ApiProvider::OpenaiCodex;
+    let route = ModelRoute::Fixed("gpt-5.5-codex".to_string());
+    let annotated = annotate_child_model_error(
+        &subagent_failure_message(&err),
+        "gpt-5.5-codex",
+        provider,
+        &route,
+    );
 
     // Class tag from subagent_failure_message.
     assert!(annotated.starts_with("[auth]"), "{annotated}");
@@ -3780,6 +3787,10 @@ fn annotated_failure_message_composes_class_tag_and_model_hint() {
             || annotated.contains("child-agent model config"),
         "{annotated}"
     );
+    // #4049: the failure now names the provider and the route source.
+    assert!(annotated.contains(provider.display_name()), "{annotated}");
+    assert!(annotated.contains("route:"), "{annotated}");
+    assert!(annotated.contains("explicit model id"), "{annotated}");
 }
 
 #[test]
@@ -3827,7 +3838,9 @@ fn subagent_failure_message_preserves_error_chain() {
 fn annotate_child_model_error_adds_actionable_hint() {
     // #2653: a bare provider 403 becomes actionable by naming the model and the
     // recovery path, while unrelated errors pass through unchanged.
-    let auth = annotate_child_model_error("403 Forbidden", "kimi-k2");
+    let provider = crate::config::ApiProvider::Moonshot;
+    let inherit = ModelRoute::Inherit;
+    let auth = annotate_child_model_error("403 Forbidden", "kimi-k2", provider, &inherit);
     assert!(auth.contains("kimi-k2"), "names the model: {auth}");
     assert!(
         auth.contains("child model override"),
@@ -3837,13 +3850,19 @@ fn annotate_child_model_error_adds_actionable_hint() {
         auth.contains("403 Forbidden"),
         "preserves the original: {auth}"
     );
+    // #4049: provider + route source are named in the hint.
+    assert!(auth.contains(provider.display_name()), "{auth}");
+    assert!(auth.contains("inherited from the parent"), "{auth}");
 
-    let unrelated = annotate_child_model_error("connection reset by peer", "kimi-k2");
+    // Unrelated errors still pass through completely unchanged (no provider
+    // /route noise on a network failure).
+    let unrelated =
+        annotate_child_model_error("connection reset by peer", "kimi-k2", provider, &inherit);
     assert_eq!(unrelated, "connection reset by peer");
 
     // #3020: provider rejections that classify as Internal (not
     // Authorization/State) still get the hint via raw-text matching.
-    let not_exist = annotate_child_model_error("Model Not Exist", "kimi-k2");
+    let not_exist = annotate_child_model_error("Model Not Exist", "kimi-k2", provider, &inherit);
     assert!(
         not_exist.contains("child-agent model config"),
         "DeepSeek-style rejection gets the hint: {not_exist}"
@@ -3852,10 +3871,56 @@ fn annotate_child_model_error_adds_actionable_hint() {
     let openai_style = annotate_child_model_error(
         "The model `gpt-5.5-nano` does not exist or you do not have access to it.",
         "gpt-5.5-nano",
+        crate::config::ApiProvider::OpenaiCodex,
+        &ModelRoute::Fixed("gpt-5.5-nano".to_string()),
     );
     assert!(
         openai_style.contains("child-agent model config"),
         "OpenAI-style rejection gets the hint: {openai_style}"
+    );
+}
+
+#[test]
+fn child_launch_error_names_provider_model_and_route_source() {
+    // #4049: a model-not-found child launch failure must name the provider
+    // that was used, the model that was requested, and the route that produced
+    // it, so the parent (and user) can tell whether the provider context was
+    // lost, the wrong model was requested, or an override needs adjusting.
+    let err = anyhow::Error::new(crate::llm_client::LlmError::ModelError(
+        "Model \"deepseek-v4-pro\" not found".to_string(),
+    ));
+    let provider = crate::config::ApiProvider::Deepseek;
+    let route = ModelRoute::Fixed("deepseek-v4-pro".to_string());
+    let annotated = annotate_child_model_error(
+        &subagent_failure_message(&err),
+        "deepseek-v4-pro",
+        provider,
+        &route,
+    );
+    assert!(
+        annotated.contains(provider.display_name()),
+        "provider: {annotated}"
+    );
+    assert!(annotated.contains("deepseek-v4-pro"), "model: {annotated}");
+    assert!(
+        annotated.contains("route:"),
+        "route label present: {annotated}"
+    );
+    assert!(
+        annotated.contains("explicit model id"),
+        "route source: {annotated}"
+    );
+
+    // The route label reflects an inherited route distinctly from a fixed one.
+    let inherited = annotate_child_model_error(
+        &subagent_failure_message(&err),
+        "deepseek-v4-pro",
+        provider,
+        &ModelRoute::Inherit,
+    );
+    assert!(
+        inherited.contains("inherited from the parent"),
+        "inherit route source: {inherited}"
     );
 }
 
