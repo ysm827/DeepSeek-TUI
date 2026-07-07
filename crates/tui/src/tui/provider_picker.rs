@@ -80,6 +80,7 @@ pub struct ProviderPickerView {
     stage: Stage,
     view: ProviderListView,
     setup_mode: bool,
+    query: String,
     api_key_input: String,
     custom_provider_field: CustomProviderField,
     custom_provider_id: String,
@@ -592,6 +593,20 @@ impl ProviderDashboardRow {
             ProviderCatalogStatus::DefaultOnly => "default-only".to_string(),
             ProviderCatalogStatus::Legacy => "legacy".to_string(),
         }
+    }
+
+    /// Cross-field search (#3830 P1): match a query against display name,
+    /// provider id, kind, base URL, and the compact hint fields.
+    fn matches_query(&self, query: &str) -> bool {
+        let query = query.trim().to_ascii_lowercase();
+        if query.is_empty() {
+            return true;
+        }
+        self.display_name.to_ascii_lowercase().contains(&query)
+            || self.provider_id.to_ascii_lowercase().contains(&query)
+            || self.kind.to_ascii_lowercase().contains(&query)
+            || self.base_url.to_ascii_lowercase().contains(&query)
+            || self.provider.as_str().to_ascii_lowercase().contains(&query)
     }
 }
 
@@ -1144,6 +1159,7 @@ impl ProviderPickerView {
             view,
             setup_mode: false,
             api_key_input: String::new(),
+            query: String::new(),
             custom_provider_field: CustomProviderField::Name,
             custom_provider_id: String::new(),
             custom_provider_base_url: String::new(),
@@ -1203,6 +1219,10 @@ impl ProviderPickerView {
     }
 
     fn row_visible(&self, idx: usize) -> bool {
+        let query = self.query.trim();
+        if !query.is_empty() {
+            return self.rows[idx].matches_query(query);
+        }
         match self.view {
             ProviderListView::Catalog => true,
             ProviderListView::Configured => self.rows[idx].is_configured,
@@ -1232,6 +1252,14 @@ impl ProviderPickerView {
         }
     }
 
+    /// Update the search query and clamp the selection to the first visible row.
+    fn update_query(&mut self, next: String) {
+        self.query = next;
+        self.selected_idx = (0..self.rows.len())
+            .find(|idx| self.row_visible(*idx))
+            .unwrap_or(0);
+    }
+
     /// Move the selection one visible row forward (`step = 1`) or backward
     /// (`step = -1`), skipping rows hidden by the current `view` filter
     /// (#3830) and wrapping at the ends.
@@ -1256,30 +1284,6 @@ impl ProviderPickerView {
 
     fn move_down(&mut self) {
         self.move_selection(1);
-    }
-
-    /// Type-ahead: move the selection to the next visible provider whose
-    /// display name starts with the given character (case-insensitive),
-    /// wrapping so repeated presses cycle through matches — e.g. pressing
-    /// `z` jumps to "Z.ai".
-    fn jump_to_letter(&mut self, c: char) {
-        let count = self.rows.len();
-        if count == 0 {
-            return;
-        }
-        let target = c.to_ascii_lowercase();
-        for offset in 1..=count {
-            let idx = (self.selected_idx + offset) % count;
-            if self.row_visible(idx)
-                && self.rows[idx]
-                    .display_name
-                    .to_ascii_lowercase()
-                    .starts_with(target)
-            {
-                self.selected_idx = idx;
-                return;
-            }
-        }
     }
 
     fn selected_provider(&self) -> ApiProvider {
@@ -1444,32 +1448,57 @@ impl ProviderPickerView {
             ProviderListView::Configured => "browse all",
             ProviderListView::Catalog => "configured",
         };
+        let search_active = !self.query.trim().is_empty();
         // The action footer moves into the body so it wraps instead of clipping
         // at narrow widths (#3732); the provider list renders above it.
-        let content = render_modal_footer(
-            inner,
-            buf,
-            &[
-                ActionHint::new("↑↓", "move"),
-                ActionHint::new("a-z", "jump"),
-                ActionHint::new("Enter", enter_action),
-                ActionHint::new("A", view_action),
-                ActionHint::new("C", "custom"),
-                ActionHint::new("R", "edit key"),
-                ActionHint::new("M", "models"),
-                ActionHint::new("Esc", "cancel"),
-            ],
-        );
+        let content = if search_active {
+            render_modal_footer(
+                inner,
+                buf,
+                &[
+                    ActionHint::new("Esc", "clear"),
+                    ActionHint::new("↑↓", "move"),
+                    ActionHint::new("Enter", enter_action),
+                    ActionHint::new("A", view_action),
+                    ActionHint::new("C", "custom"),
+                    ActionHint::new("Esc", "cancel"),
+                ],
+            )
+        } else {
+            render_modal_footer(
+                inner,
+                buf,
+                &[
+                    ActionHint::new("↑↓", "move"),
+                    ActionHint::new("a-z", "jump"),
+                    ActionHint::new("Enter", enter_action),
+                    ActionHint::new("A", view_action),
+                    ActionHint::new("C", "custom"),
+                    ActionHint::new("R", "edit key"),
+                    ActionHint::new("M", "models"),
+                    ActionHint::new("Esc", "cancel"),
+                ],
+            )
+        };
 
         let filtered = self.filtered_rows();
         if filtered.is_empty() {
-            EmptyState::new(
-                "No providers configured yet",
-                "Browse every supported provider or create a custom endpoint.",
-            )
-            .primary_action("A", "browse all")
-            .secondary_action("C", "custom")
-            .render(content, buf);
+            if search_active {
+                EmptyState::new(
+                    "No providers match",
+                    "Try a different search term or clear to browse.",
+                )
+                .primary_action("Esc", "clear search")
+                .render(content, buf);
+            } else {
+                EmptyState::new(
+                    "No providers configured yet",
+                    "Browse every supported provider or create a custom endpoint.",
+                )
+                .primary_action("A", "browse all")
+                .secondary_action("C", "custom")
+                .render(content, buf);
+            }
             return;
         }
 
@@ -1882,6 +1911,10 @@ impl ModalView for ProviderPickerView {
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
         match self.stage {
             Stage::List => match key.code {
+                KeyCode::Esc if !self.query.is_empty() => {
+                    self.update_query(String::new());
+                    ViewAction::None
+                }
                 KeyCode::Esc => ViewAction::Close,
                 KeyCode::Up => {
                     self.move_up();
@@ -1915,6 +1948,7 @@ impl ModalView for ProviderPickerView {
                 KeyCode::Char(c)
                     if key.modifiers.is_empty()
                         && c.eq_ignore_ascii_case(&'r')
+                        && self.query.is_empty()
                         && self.row_visible(self.selected_idx) =>
                 {
                     self.enter_key_entry();
@@ -1924,11 +1958,19 @@ impl ModalView for ProviderPickerView {
                 // full provider catalog (#3830). Handled before the
                 // type-ahead arm so `a`/`A` always toggles instead of
                 // seeking a provider whose name starts with "a".
-                KeyCode::Char(c) if key.modifiers.is_empty() && c.eq_ignore_ascii_case(&'a') => {
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty()
+                        && self.query.is_empty()
+                        && c.eq_ignore_ascii_case(&'a') =>
+                {
                     self.toggle_view();
                     ViewAction::None
                 }
-                KeyCode::Char(c) if key.modifiers.is_empty() && c.eq_ignore_ascii_case(&'c') => {
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty()
+                        && self.query.is_empty()
+                        && c.eq_ignore_ascii_case(&'c') =>
+                {
                     self.enter_custom_form();
                     ViewAction::None
                 }
@@ -1937,6 +1979,7 @@ impl ModalView for ProviderPickerView {
                 // models instead of seeking a provider whose name starts with m.
                 KeyCode::Char(c)
                     if key.modifiers.is_empty()
+                        && self.query.is_empty()
                         && c.eq_ignore_ascii_case(&'m')
                         && self.row_visible(self.selected_idx) =>
                 {
@@ -1947,10 +1990,21 @@ impl ModalView for ProviderPickerView {
                         provider_id,
                     })
                 }
-                // Type-ahead: any other letter jumps to the next provider whose
-                // name starts with it (e.g. `z` -> "Z.ai").
-                KeyCode::Char(c) if key.modifiers.is_empty() && c.is_ascii_alphabetic() => {
-                    self.jump_to_letter(c);
+                KeyCode::Backspace if !self.query.is_empty() => {
+                    let mut query = self.query.clone();
+                    query.pop();
+                    self.update_query(query);
+                    ViewAction::None
+                }
+                KeyCode::Char(ch)
+                    if key.modifiers.is_empty()
+                        && !key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    let mut query = self.query.clone();
+                    query.push(ch);
+                    self.update_query(query);
                     ViewAction::None
                 }
                 _ => ViewAction::None,
@@ -2200,8 +2254,23 @@ mod tests {
         // Z.ai isn't configured, so it's hidden by the default view (#3830);
         // browse the full catalog like a user pressing `A` would.
         picker.toggle_view();
-        // `z` is unique to Z.ai among provider display names.
-        picker.handle_key(key(KeyCode::Char('z')));
+        // Search for "zai" — unique enough to match only Z.ai.
+        for c in "zai".chars() {
+            picker.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(picker.query, "zai");
+        let filtered = picker.filtered_rows();
+        assert!(!filtered.is_empty(), "search for 'zai' must match Z.ai");
+        assert!(
+            filtered
+                .iter()
+                .any(|(_, row)| row.provider == ApiProvider::Zai),
+            "Z.ai must be in filtered results: {:?}",
+            filtered
+                .iter()
+                .map(|(_, r)| &r.display_name)
+                .collect::<Vec<_>>()
+        );
         assert_eq!(picker.selected_provider(), ApiProvider::Zai);
     }
 
@@ -3430,9 +3499,9 @@ mod tests {
         };
         let picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
 
-        let rendered = render_text(&picker, 80, 12);
+        let rendered = render_text(&picker, 80, 14);
 
-        assert!(rendered.contains("Enter"));
+        assert!(rendered.contains("Enter"), "rendered: {rendered}");
         assert!(rendered.contains("apply"));
         assert!(rendered.contains("edit key"));
     }

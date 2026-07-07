@@ -2250,7 +2250,11 @@ mod tests {
         assert!(result.content.contains("file1.txt"));
         assert!(result.content.contains("file2.txt"));
         assert!(result.content.contains("subdir"));
-        assert!(result.content.contains("\"is_dir\": true"));
+        let entries: Value = serde_json::from_str(&result.content).expect("list_dir json");
+        assert!(entries.as_array().expect("entries").iter().any(|entry| {
+            entry.get("name").and_then(Value::as_str) == Some("subdir")
+                && entry.get("is_dir").and_then(Value::as_bool) == Some(true)
+        }));
     }
 
     #[tokio::test]

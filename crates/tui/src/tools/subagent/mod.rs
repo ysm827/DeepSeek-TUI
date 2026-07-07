@@ -58,15 +58,14 @@ pub use mailbox::{Mailbox, MailboxEnvelope, MailboxMessage, MailboxReceiver};
 /// Maps file path → agent id. Agents hold a lease on a file while running;
 /// the lease is released when the agent reaches a terminal state.
 static RESIDENT_LEASES: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, String>>,
+    parking_lot::Mutex<std::collections::HashMap<String, String>>,
 > = std::sync::OnceLock::new();
 
 /// Release all resident file leases held by `agent_id`. Called when an
 /// agent transitions to a terminal state (completed, failed, cancelled).
 fn release_resident_leases_for(agent_id: &str) {
-    if let Some(lock) = RESIDENT_LEASES.get()
-        && let Ok(mut guard) = lock.lock()
-    {
+    if let Some(lock) = RESIDENT_LEASES.get() {
+        let mut guard = lock.lock();
         guard.retain(|_, owner| owner != agent_id);
     }
 }
@@ -3875,35 +3874,36 @@ async fn spawn_subagent_from_input(
     };
     // Resolved before the prompt is moved out of the request below.
     let requested_model_route = spawn_model_route(&spawn_request, profile_member.as_ref());
-    let (effective_prompt, _resident_conflict) =
-        if let Some(ref file_path) = spawn_request.resident_file {
-            let abs_path = if std::path::Path::new(file_path).is_absolute() {
-                std::path::PathBuf::from(file_path)
-            } else {
-                runtime.context.workspace.join(file_path)
-            };
-            let file_contents = std::fs::read_to_string(&abs_path)
-                .unwrap_or_else(|e| format!("<!-- resident_file read error: {e} -->"));
-            let prefixed = format!(
-                "<!-- resident_file: {file_path} -->\n```\n{file_contents}\n```\n\n{}",
-                spawn_request.prompt
-            );
-            let conflict = {
-                let leases = RESIDENT_LEASES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-                let mut guard = leases.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(owner) = guard.get(file_path) {
-                    Some(format!(
-                        "Warning: agent {owner} already holds a resident lease on {file_path}"
-                    ))
-                } else {
-                    guard.insert(file_path.clone(), "pending".to_string());
-                    None
-                }
-            };
-            (prefixed, conflict)
+    let (effective_prompt, _resident_conflict) = if let Some(ref file_path) =
+        spawn_request.resident_file
+    {
+        let abs_path = if std::path::Path::new(file_path).is_absolute() {
+            std::path::PathBuf::from(file_path)
         } else {
-            (spawn_request.prompt, None)
+            runtime.context.workspace.join(file_path)
         };
+        let file_contents = std::fs::read_to_string(&abs_path)
+            .unwrap_or_else(|e| format!("<!-- resident_file read error: {e} -->"));
+        let prefixed = format!(
+            "<!-- resident_file: {file_path} -->\n```\n{file_contents}\n```\n\n{}",
+            spawn_request.prompt
+        );
+        let conflict = {
+            let leases = RESIDENT_LEASES.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+            let mut guard = leases.lock();
+            if let Some(owner) = guard.get(file_path) {
+                Some(format!(
+                    "Warning: agent {owner} already holds a resident lease on {file_path}"
+                ))
+            } else {
+                guard.insert(file_path.clone(), "pending".to_string());
+                None
+            }
+        };
+        (prefixed, conflict)
+    } else {
+        (spawn_request.prompt, None)
+    };
 
     let route = resolve_subagent_assignment_route(
         &runtime,
@@ -3944,11 +3944,13 @@ async fn spawn_subagent_from_input(
 
     if let Some(ref file_path) = spawn_request.resident_file
         && let Some(lock) = RESIDENT_LEASES.get()
-        && let Ok(mut guard) = lock.lock()
-        && let Some(owner) = guard.get_mut(file_path)
-        && owner == "pending"
     {
-        *owner = result.agent_id.clone();
+        let mut guard = lock.lock();
+        if let Some(owner) = guard.get_mut(file_path)
+            && owner == "pending"
+        {
+            *owner = result.agent_id.clone();
+        }
     }
 
     Ok((result, spawn_policy_note))

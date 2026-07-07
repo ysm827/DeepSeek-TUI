@@ -21,25 +21,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Lifecycle status of a conversation thread.
-///
-/// Serialized as lowercase snake_case strings (e.g. `"running"`, `"archived"`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ThreadStatus {
-    /// Thread is actively being worked on.
-    Running,
-    /// Thread exists but has no active work in progress.
-    Idle,
-    /// Thread has finished its task successfully.
-    Completed,
-    /// Thread encountered an unrecoverable error.
-    Failed,
-    /// Thread has been temporarily paused by the user.
-    Paused,
-    /// Thread has been archived and is hidden from default listings.
-    Archived,
-}
+// Re-export protocol's ThreadStatus so callers in the state crate and
+// external consumers (e.g. core) can reference a single canonical definition.
+pub use codewhale_protocol::ThreadStatus;
 
 /// Indicates how a session was initiated.
 ///

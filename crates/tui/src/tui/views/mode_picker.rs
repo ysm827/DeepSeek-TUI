@@ -10,7 +10,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::localization::{Locale, MessageId, tr};
+use crate::localization::Locale;
 use crate::palette;
 use crate::tui::app::AppMode;
 use crate::tui::views::{
@@ -123,11 +123,7 @@ impl ModalView for ModePickerView {
             ],
         );
 
-        let mut lines = Vec::with_capacity(AppMode::CHOICES.len() + 1);
-        lines.push(Line::from(Span::styled(
-            tr(self.locale, MessageId::ModePickerPrompt),
-            Style::default().fg(palette::TEXT_MUTED),
-        )));
+        let mut lines = Vec::with_capacity(AppMode::CHOICES.len());
 
         for (idx, mode) in AppMode::CHOICES.iter().copied().enumerate() {
             let is_cursor = idx == self.cursor;

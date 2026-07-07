@@ -3120,6 +3120,19 @@ impl App {
             return;
         }
         self.yolo_compat_notified = true;
+        // Per-install suppression: check the persisted flag so the toast
+        // appears exactly once across sessions, not every launch.
+        if let Ok(settings) = crate::settings::Settings::load() {
+            if settings.yolo_deprecation_shown {
+                return;
+            }
+        }
+        // Persist the flag best-effort; toast still fires even if the write
+        // fails (retries on the next attempt).
+        if let Ok(mut settings) = crate::settings::Settings::load() {
+            settings.yolo_deprecation_shown = true;
+            let _ = settings.save();
+        }
         self.push_status_toast(
             "YOLO mode is deprecated — use Act + Bypass permissions (Shift+Tab)".to_string(),
             StatusToastLevel::Warning,
@@ -5657,13 +5670,15 @@ impl App {
 
     /// Decide how to route a fresh composer submit.
     ///
-    /// v0.8.68: busy always queues. A double-tap Enter within 500 ms
-    /// triggers Steer via [`enter_with_double_tap`]; Ctrl+Enter forces
+    /// v0.8.68: streaming output queues. Busy-but-waiting turns steer so
+    /// Enter can amend the active turn before output starts. A double-tap
+    /// Enter within 500 ms triggers Steer while streaming; Ctrl+Enter forces
     /// Steer in all busy states.
     ///
     /// Truth table:
     ///   offline=F, busy=F → Immediate
-    ///   offline=F, busy=T → Queue (double-tap → Steer)
+    ///   offline=F, busy=T, streaming=F → Steer
+    ///   offline=F, busy=T, streaming=T → Queue (double-tap → Steer)
     ///   offline=T, busy=* → Queue
     #[must_use]
     pub fn decide_submit_disposition(&self) -> SubmitDisposition {
@@ -5673,8 +5688,12 @@ impl App {
         if !self.is_loading {
             return SubmitDisposition::Immediate;
         }
-        // Busy: queue the message. Double-tap Enter within 500 ms triggers
-        // Steer via enter_with_double_tap(); see the ui.rs submit handler.
+        if self.streaming_message_index.is_none() {
+            return SubmitDisposition::Steer;
+        }
+        // Streaming: queue the message. Double-tap Enter within 500 ms
+        // triggers Steer via enter_with_double_tap(); see the ui.rs submit
+        // handler.
         SubmitDisposition::Queue
     }
 

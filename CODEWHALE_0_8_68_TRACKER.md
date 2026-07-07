@@ -13,6 +13,16 @@
 > **Sub-agent sweep completed 2026-07-07.** Six parallel scouts produced the
 > release plan below. Workflow file:
 > `CodeWhale/workflows/v0868_issue_sweep.workflow.js`.
+>
+> **2026-07-07 cutover correction — source of truth.** Work for this release
+> belongs in `.cw-worktrees/v0867-pr4047` on `work/v0.9.0-cutover`. The
+> durable PR base was `883f94df6`; the quick-win layer that followed was
+> briefly stranded as uncommitted working-tree changes. This tracker update
+> travels with that quick-win layer: OpenRouter live catalog parsing, provider
+> picker search, Status/ToolDescriptor concept-map cleanup, copy/perf fixes,
+> foreground shell compacting, and test alignment are locally verified here.
+> Do not mark work complete from another checkout unless the symbols and tests
+> are verified in this worktree.
 
 ## VERDICT: **partial** — can ship a narrow 0.8.68 patch after Wave 1–2
 
@@ -432,27 +442,54 @@ Manual: Win11 Enter-during-busy (#1338), 15+ min turn follow-up (#2317), approva
 ---
 
 
-## Review pass (2026-07-07, pre-commit verification)
+## Quick-win cutover verification (2026-07-07)
 
-Sequential wave review + gap-fill over the uncommitted train in
-`.cw-worktrees/v0867-pr4047`. Final gate, all green:
+Verified in `.cw-worktrees/v0867-pr4047` on `work/v0.9.0-cutover`.
+Topology before the quick-win commit: `origin/main...HEAD = 0 behind / 9 ahead`
+with `origin/main` at `cdb52ee48` and branch head `883f94df6`.
 
-- `cargo test -p codewhale-tui --bin codewhale-tui --locked` — **5938 passed / 0 failed / 2 ignored** (two consecutive full runs)
-- `cargo test -p codewhale-{app-server,secrets,hooks,config,core,state,mcp,execpolicy} --locked` — all green
-- `cargo test -p codewhale-workflow --locked` 73/73 · `codewhale-workflow-js` green
-- `cargo clippy -p codewhale-tui --all-features --locked` — **0 warnings** · `cargo fmt --all --check` clean
+**Verified complete in this layer**
 
-Fixes added by the review pass itself (beyond wave agents' work):
+- **S1.1 OpenRouter live parser:** `parse_openrouter_models_response` maps
+  limits, pricing, reasoning support, and modalities into `CatalogOffering`.
+- **Provider lake live bridge:** `refresh_catalog_cache` now publishes fresh
+  cache snapshots into `provider_lake`; the remaining #3385 work is scheduling
+  or invoking refresh from UI/runtime surfaces.
+- **S3 picker search:** provider picker search matches provider name and model
+  ids across configured/catalog views.
+- **S4 concept-map cleanup:** `ThreadStatus` dedupe, `ToolDescriptor` rename,
+  `Status` trait, and `MODEL_ALIAS_PRECEDENCE.md` are present.
+- **S5 copy cleanup:** verified items 5.1-5.6 plus compact foreground shell
+  wait and stale test copy updates are in this layer; remaining copy items stay
+  open in the audit table.
+- **S6 perf quick wins:** the verified subset is present; do not mark the full
+  perf list complete until the remaining unchecked S6 items are implemented.
+- **Wave 2 wait-state behavior:** streaming Enter queues follow-up; model
+  waiting Enter steers immediately; double-tap still steers while streaming.
 
-- **State-store self-deadlock** — `record_thread_goal_usage`/`record_thread_goal_continuation` re-locked the connection mutex via `get_thread_goal`; now read on the held connection (`read_thread_goal`). NOTE: upstream main fixed the same bug (`5331d10d6`) — dedupe on merge.
-- **Watchdog tiering** — Wave 2 set TOOL_HANG = TURN_STALL (300s); restored to 600s so running tools outlive the turn-stall threshold (#1862 still 15m→10m).
-- **Journal orphan recovery** — hydrated runs stuck `running` flip to `failed` (+ test).
-- **M3 finisher** — one-shot Shift+Tab→Ctrl+T rebinding toast (+ test); stale Ctrl+T doc comments fixed.
-- **Wave 4 gap-fill** — DD #19 graceful shutdown, #25 non-blocking bridge Drop, #33 secrets fsync, #34 constant-time token compare, #36 SSE frame bound, #37 stdio shutdown child reap, #42 webhook timeout.
-- **Post-drift fixes** — `--yolo` start no longer leaks Bypass into the durable Agent baseline; bundled-catalog rows added (Zai `GLM-5-Turbo`, OpenRouter `z-ai/glm-5.2`); sidebar terminal-row label suppresses stale progress; workflow/verifier test-isolation guards; CHANGELOG `[Unreleased]` written.
+**Local verification**
 
-GitHub close-out (2026-07-07): closed #1607, #1678, #1853, #2067, #2070 (audit closes), #1338, #2317, #2068, #2069 (fixed in train); progress comments on #4011/#4013/#4038 (kept open — asks broader than shipped slices); #2061 umbrella checklist updated. Already closed prior: #1327, #3324, #3386, #3387, #1830, #1198, #1862, #3380.
+- `cargo fmt --all --check` — pass
+- `cargo clippy --workspace --all-features --locked -- -D warnings ...` — pass
+- `cargo test -p codewhale-tools --locked` — pass, 18 tests
+- `cargo test -p codewhale-tui --bin codewhale-tui --locked --quiet` — pass,
+  **5976 passed / 0 failed / 2 ignored**
+- `cargo test -p codewhale-workflow --locked javascript --quiet` — pass,
+  6 tests
+- `./scripts/release/check-versions.sh` — pass, workspace/npm/lockfile in sync
 
-Landing: branch is 80 commits behind origin/main (all prior branch commits already merged via PR #4047); merge origin/main into the branch post-commit, dedupe the state-deadlock fix, re-run the gate, then PR → main.
+**Still open before merge to main**
 
-*Last updated: 2026-07-07 after the full review pass (Waves 1–7 verified, gate green, issues closed).*
+- Push the quick-win commit to `origin/work/v0.9.0-cutover` so PR #4099 runs CI
+  on this exact state.
+- Check PR #4099 macOS CI after push; the earlier red macOS job ran against the
+  old committed head and is not evidence for or against this quick-win layer.
+- Fleet/AgentProfile cutover remains open: Fleet should keep execution
+  durability (`manager.rs`, `ledger.rs`, `executor.rs`, `task_spec.rs`) while
+  consuming canonical AgentProfiles instead of maintaining a separate
+  loadout/model-class profile system.
+- Catalog consumer migration beyond S1.1/S3, Section 2 workflow UI/launch, and
+  unchecked copy/perf items remain open unless separately verified in code.
+
+*Last updated: 2026-07-07 after quick-win layer verification and tracker
+correction.*

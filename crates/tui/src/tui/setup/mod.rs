@@ -6077,7 +6077,7 @@ mod tests {
         assert!(text.contains("Fleet roster:"));
         assert!(text.contains("3 Fleet members"));
         assert!(text.contains("plan limit not probed"));
-        assert!(text.contains("It does not probe plan limits"));
+        assert!(text.contains("Enter records this Operate/Fleet snapshot."));
     }
 
     #[test]
@@ -6137,7 +6137,7 @@ mod tests {
         assert!(text.contains("configured_slots=2"));
         assert!(text.contains("Bindable actions:"));
         assert!(text.contains("13 bindable actions"));
-        assert!(text.contains("without changing config"));
+        assert!(text.contains("Press H to customize slots; Enter records this Hotbar snapshot."));
     }
 
     #[test]
@@ -6204,7 +6204,7 @@ mod tests {
         assert!(text.contains("/tmp/skills"));
         assert!(text.contains("Tools dir:"));
         assert!(text.contains("Plugins dir:"));
-        assert!(text.contains("without creating directories or connecting to servers"));
+        assert!(text.contains("Enter records this Tools/MCP snapshot."));
     }
 
     #[test]
@@ -6271,7 +6271,7 @@ mod tests {
         assert!(text.contains("feishu"));
         assert!(text.contains("Remote mode:"));
         assert!(text.contains("--apply not implemented"));
-        assert!(text.contains("without generating a bundle"));
+        assert!(text.contains("Press R to preview; Enter records this Remote snapshot."));
     }
 
     #[test]
@@ -6341,9 +6341,7 @@ mod tests {
         assert!(text.contains("Constitution:"));
         assert!(text.contains("Memory:"));
         assert!(text.contains("Notes:"));
-        assert!(
-            text.contains("does not create directories, read file contents, or rewrite config")
-        );
+        assert!(text.contains("Enter records this Persistence snapshot."));
     }
 
     #[test]

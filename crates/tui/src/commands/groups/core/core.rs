@@ -1290,7 +1290,7 @@ mod tests {
         assert_eq!(app.view_stack.top_kind(), Some(ModalKind::SubAgents));
         assert_eq!(
             app.status_message,
-            Some("Fetching Fleet worker status...".to_string())
+            Some("Fetching Fleet status...".to_string())
         );
     }
 

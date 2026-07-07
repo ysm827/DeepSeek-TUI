@@ -1576,6 +1576,7 @@ fn test_mode_switch_does_not_emit_redundant_toast() {
 #[test]
 fn test_mode_switch_toasts_do_not_disrupt_non_mode_toasts() {
     let mut app = App::new(test_options(false), &Config::default());
+    app.yolo_compat_notified = true;
     app.status_message = Some("Task queued".to_string());
     app.sync_status_message_to_toasts();
 
@@ -1584,16 +1585,11 @@ fn test_mode_switch_toasts_do_not_disrupt_non_mode_toasts() {
     app.set_mode(AppMode::Yolo);
     app.sync_status_message_to_toasts();
 
-    assert_eq!(app.status_toasts.len(), 2);
+    assert_eq!(app.status_toasts.len(), 1);
     assert!(
         app.status_toasts
             .iter()
             .any(|toast| toast.text == "Task queued")
-    );
-    assert!(
-        app.status_toasts
-            .iter()
-            .any(|toast| toast.text.contains("YOLO mode is deprecated"))
     );
 }
 
@@ -2755,13 +2751,13 @@ fn submit_disposition_immediate_when_idle_and_online() {
 
 #[test]
 fn submit_disposition_queue_when_busy_and_online_not_streaming() {
-    // Double-enter steer: Busy + not streaming now returns Queue; steering
-    // is triggered externally via enter_with_double_tap() or Ctrl+Enter.
+    // Busy but not streaming means the model is still waiting, so Enter can
+    // amend the active turn immediately.
     let mut app = App::new(test_options(false), &Config::default());
     app.is_loading = true;
     app.offline_mode = false;
-    // streaming_message_index is None (default) → tool execution phase
-    assert_eq!(app.decide_submit_disposition(), SubmitDisposition::Queue);
+    // streaming_message_index is None (default) → waiting phase
+    assert_eq!(app.decide_submit_disposition(), SubmitDisposition::Steer);
 }
 
 #[test]
@@ -2795,9 +2791,10 @@ fn submit_disposition_offline_busy_queues() {
 #[test]
 fn double_enter_detects_steering() {
     let mut app = App::new(test_options(false), &Config::default());
-    // Simulate a busy engine (not streaming) so decide_submit_disposition
-    // returns Queue rather than Immediate.
+    // Simulate a busy engine that is already streaming so the first Enter
+    // queues; the second tap escalates to steer.
     app.is_loading = true;
+    app.streaming_message_index = Some(0);
 
     // First Enter → Queue (normal queueing)
     let first = app.enter_with_double_tap();
@@ -2812,6 +2809,7 @@ fn double_enter_detects_steering() {
 fn double_enter_resets_after_timeout() {
     let mut app = App::new(test_options(false), &Config::default());
     app.is_loading = true;
+    app.streaming_message_index = Some(0);
 
     // First Enter → Queue
     let first = app.enter_with_double_tap();

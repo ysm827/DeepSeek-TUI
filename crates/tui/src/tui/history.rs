@@ -671,7 +671,7 @@ impl ExecCell {
     ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         let command_summary = command_header_summary(&self.command);
-        let compact_foreground_wait = mode == RenderMode::Live && self.is_foreground_shell_wait();
+        let compact_foreground_wait = self.is_foreground_shell_wait();
         let header_summary = if compact_foreground_wait {
             Some(FOREGROUND_SHELL_WAIT_HINT)
         } else {

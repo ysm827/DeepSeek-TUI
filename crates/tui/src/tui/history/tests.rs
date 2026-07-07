@@ -1266,8 +1266,12 @@ fn exec_cell_header_includes_compact_command_summary() {
         .map(|s| s.content.as_ref())
         .collect::<String>();
     assert!(
-        transcript_visible.contains("cargo test --workspace --all-features"),
-        "transcript header should expose command target: {transcript_visible:?}"
+        transcript_visible.contains("Ctrl+B"),
+        "transcript compact wait should expose Ctrl+B hint: {transcript_visible:?}"
+    );
+    assert!(
+        !transcript_visible.contains("cargo test --workspace --all-features"),
+        "transcript compact wait must not repeat command target: {transcript_visible:?}"
     );
 }
 
@@ -1657,8 +1661,12 @@ fn exec_cell_renders_live_shell_output_before_final_output() {
     assert!(!live_text.contains("Ctrl+B moves this shell wait to /jobs"));
 
     let transcript_text = lines_text(&HistoryCell::Tool(ToolCell::Exec(cell)).transcript_lines(80));
-    assert!(transcript_text.contains("running line 1"));
-    assert!(transcript_text.contains("command:"));
+    assert!(
+        !transcript_text.contains("running line 1"),
+        "foreground shell live output belongs in sidebar/jobs, not transcript: {transcript_text}"
+    );
+    assert!(!transcript_text.contains("command:"));
+    assert!(transcript_text.contains("Ctrl+B"));
 }
 
 #[test]

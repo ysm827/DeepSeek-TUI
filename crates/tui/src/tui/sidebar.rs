@@ -3101,32 +3101,16 @@ fn render_context_panel(f: &mut Frame, area: Rect, app: &mut App) {
     ]));
 
     // ── Token usage ──────────────────────────────────────────────
+    // Context % is disclosed in the header; the sidebar keeps the raw token
+    // counts for at-a-glance reference without duplicating the bar.
     let total_tokens = app.session.total_conversation_tokens;
     let window = crate::route_budget::route_context_window_tokens(
         app.api_provider,
         app.effective_model_for_budget(),
         app.active_route_limits,
     );
-    let pct = if window > 0 {
-        ((total_tokens as f64 / window as f64) * 100.0).clamp(0.0, 100.0)
-    } else {
-        0.0
-    };
-    let bar_width = content_width.min(20);
-    let filled = ((pct / 100.0) * bar_width as f64) as usize;
-    let bar = format!(
-        "[{}{}] {:.0}%",
-        "█".repeat(filled),
-        "░".repeat(bar_width.saturating_sub(filled)),
-        pct
-    );
     lines.push(Line::from(Span::styled(
-        format!(
-            "context: {}/{} tokens  {}",
-            total_tokens,
-            window,
-            truncate_line_to_width(&bar, content_width.saturating_sub(32).max(8))
-        ),
+        format!("context: {total_tokens}/{window} tokens"),
         Style::default().fg(theme.text_muted),
     )));
 

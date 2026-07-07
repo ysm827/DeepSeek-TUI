@@ -17,10 +17,10 @@ use codewhale_mcp::{
 };
 use codewhale_protocol::{
     AppResponse, EventFrame, ExecApprovalRequestEvent, PromptRequest, PromptResponse,
-    ResponseChannel, ReviewDecision, Thread, ThreadForkParams, ThreadGoal, ThreadGoalClearParams,
-    ThreadGoalGetParams, ThreadGoalProgressParams, ThreadGoalSetParams, ThreadGoalStatus,
-    ThreadListParams, ThreadReadParams, ThreadRequest, ThreadResponse, ThreadResumeParams,
-    ThreadSetNameParams, ThreadStatus, ToolPayload, UserInputRequestEvent,
+    ResponseChannel, ReviewDecision, Status, Thread, ThreadForkParams, ThreadGoal,
+    ThreadGoalClearParams, ThreadGoalGetParams, ThreadGoalProgressParams, ThreadGoalSetParams,
+    ThreadGoalStatus, ThreadListParams, ThreadReadParams, ThreadRequest, ThreadResponse,
+    ThreadResumeParams, ThreadSetNameParams, ThreadStatus, ToolPayload, UserInputRequestEvent,
 };
 use codewhale_state::{
     JobStateRecord, JobStateStatus, SessionSource, StateStore, ThreadGoalRecord,
@@ -89,6 +89,18 @@ pub enum JobStatus {
     Failed,
     /// Cancelled by the user.
     Cancelled,
+}
+
+impl Status for JobStatus {
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+    fn is_active(&self) -> bool {
+        matches!(self, Self::Queued | Self::Running)
+    }
+    fn is_paused(&self) -> bool {
+        matches!(self, Self::Paused)
+    }
 }
 
 const JOB_DETAIL_SCHEMA_VERSION: u8 = 1;
@@ -2952,7 +2964,7 @@ mod tests {
         use codewhale_hooks::HookDispatcher;
         use codewhale_mcp::McpManager;
         use codewhale_protocol::{ToolKind, ToolOutput, ToolPayload};
-        use codewhale_tools::{FunctionCallError, ToolHandler, ToolInvocation, ToolSpec};
+        use codewhale_tools::{FunctionCallError, ToolDescriptor, ToolHandler, ToolInvocation};
 
         struct SlowTool;
         #[async_trait]
@@ -2976,7 +2988,7 @@ mod tests {
         let mut registry = ToolRegistry::default();
         registry
             .register(
-                ToolSpec {
+                ToolDescriptor {
                     name: "slow_tool".to_string(),
                     input_schema: json!({"type":"object"}),
                     output_schema: json!({"type":"object"}),
