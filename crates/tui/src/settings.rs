@@ -2008,7 +2008,7 @@ mod tests {
             unsafe {
                 std::env::set_var("NO_ANIMATIONS", truthy);
             }
-            let mut s = Settings::default();
+            let mut s = animated_settings();
             s.apply_env_overrides();
             assert!(s.low_motion, "{truthy:?} should be truthy");
         }
@@ -2017,7 +2017,7 @@ mod tests {
             unsafe {
                 std::env::set_var("NO_ANIMATIONS", falsy);
             }
-            let mut s = Settings::default();
+            let mut s = animated_settings();
             s.apply_env_overrides();
             assert!(!s.low_motion, "{falsy:?} should be falsy");
         }
@@ -2066,7 +2066,7 @@ mod tests {
     /// Serialise tests that mutate `TERM_PROGRAM` through this guard.
     /// Uses the process-wide test env lock so this serializes not just
     /// with itself but with every other env-mutating test in the suite
-    /// — otherwise a concurrent test that calls `Settings::default()`
+    /// — otherwise a concurrent test that calls `animated_settings()`
     /// can read whatever value our two `set_var`s have raced into the
     /// env at that instant.
     fn term_program_test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -2191,7 +2191,7 @@ mod tests {
             unsafe {
                 std::env::set_var("TERM_PROGRAM", program);
             }
-            let mut s = Settings::default();
+            let mut s = animated_settings();
             s.apply_env_overrides();
             assert!(
                 !s.low_motion,
