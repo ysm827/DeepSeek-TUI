@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   defaults when Models.dev has no rows.
 
 ### Added
+- Wire xAI device-code OAuth into `codewhale auth xai-device`, the TUI
+  `/auth xai-device` command, and guided provider setup, with comment-preserving
+  auth-mode persistence and loopback exchange coverage (#4257).
 - Catalog automation: `scripts/catalog_models_dev.py` refreshes secret-free
   Models.dev / OpenRouter listings and validates the offline seed snapshot
   (`snapshot --check`) without ever persisting API keys (#4117).
