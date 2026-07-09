@@ -2052,6 +2052,13 @@ pub struct Config {
     #[serde(default)]
     pub fleet: Option<codewhale_config::FleetConfigToml>,
 
+    /// Workflow automatic-launch, approval, isolation, and activity
+    /// persistence knobs (#4128). When absent, consumers use
+    /// [`codewhale_config::WorkflowConfigToml::default`] via
+    /// [`Self::workflow_config`].
+    #[serde(default)]
+    pub workflow: Option<codewhale_config::WorkflowConfigToml>,
+
     /// Sub-agent model overrides.
     #[serde(default)]
     pub subagents: Option<SubagentsConfig>,
@@ -4034,6 +4041,15 @@ impl Config {
         self.fleet.clone().unwrap_or_default()
     }
 
+    /// Parsed `[workflow]` table, or product defaults when the table is absent
+    /// (#4128 / Section 2.11). Automatic launch, approval, isolation, and
+    /// activity-persistence consumers should read through this accessor so
+    /// omitted keys share one model.
+    #[must_use]
+    pub fn workflow_config(&self) -> codewhale_config::WorkflowConfigToml {
+        self.workflow.clone().unwrap_or_default()
+    }
+
     /// Return the configured DeepSeek reasoning-effort tier, if any.
     #[must_use]
     pub fn reasoning_effort(&self) -> Option<&str> {
@@ -5647,6 +5663,7 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
             seam_model: override_cfg.context.seam_model.or(base.context.seam_model),
         },
         fleet: override_cfg.fleet.or(base.fleet),
+        workflow: override_cfg.workflow.or(base.workflow),
         subagents: override_cfg.subagents.or(base.subagents),
         strict_tool_mode: override_cfg.strict_tool_mode.or(base.strict_tool_mode),
         runtime_api: override_cfg.runtime_api.or(base.runtime_api),
