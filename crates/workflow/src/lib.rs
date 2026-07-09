@@ -4,6 +4,7 @@
 //! exposure, worktree application, replay, and model execution are layered on
 //! top only after their cancellation and evidence semantics are proven.
 
+mod elevation;
 mod js_authoring;
 mod model_policy;
 mod replay;
@@ -14,6 +15,10 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use elevation::{
+    DEFAULT_HIGH_BUDGET_THRESHOLD, ElevationOptions, PlanRiskHint, WorkflowPlanElevation,
+    assess_plan_risk_string, assess_workflow_elevation,
+};
 pub use js_authoring::{
     JavascriptWorkflowError, JavascriptWorkflowResult, compile_javascript_workflow,
     compile_typescript_workflow,

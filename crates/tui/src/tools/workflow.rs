@@ -36,6 +36,10 @@ use crate::tools::subagent::{
     WorkflowTaskSpawnIdentity, WorkflowTaskSpawnMetadata, spawn_workflow_task,
 };
 use crate::tools::verifier::run_workflow_completion_gates;
+use crate::tools::workflow_plan_approval::{
+    WorkflowPlanApprovalReceipt, analyze_workflow_plan_approval_with_config, analyze_workflow_spec,
+    workflow_approval_requirement_for,
+};
 use crate::utils::spawn_supervised;
 
 #[derive(Clone)]
@@ -241,6 +245,9 @@ struct WorkflowRunRecord {
     verify_on_complete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     verification: Option<Value>,
+    /// Durable elevated-plan approval receipt for audit (#4126).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan_approval: Option<WorkflowPlanApprovalReceipt>,
 }
 
 impl WorkflowRunRecord {
@@ -268,6 +275,7 @@ impl WorkflowRunRecord {
             error: None,
             verify_on_complete: false,
             verification: None,
+            plan_approval: None,
         }
     }
 
@@ -413,14 +421,16 @@ impl ToolSpec for WorkflowTool {
     }
 
     fn approval_requirement(&self) -> ApprovalRequirement {
+        // Default posture: elevated starts require approval. Concrete inputs
+        // refine this via `approval_requirement_for` (#4126).
         ApprovalRequirement::Required
     }
 
     fn approval_requirement_for(&self, input: &Value) -> ApprovalRequirement {
-        match parse_workflow_action(input) {
-            Ok(WorkflowAction::Status) => ApprovalRequirement::Auto,
-            _ => ApprovalRequirement::Required,
-        }
+        // Product defaults for [workflow] when the tool has no live Config
+        // handle. YOLO/bypass still short-circuit upstream of this check.
+        let config = codewhale_config::WorkflowConfigToml::default();
+        workflow_approval_requirement_for(input, &config)
     }
 
     fn starts_detached_for(&self, input: &Value) -> bool {
@@ -484,6 +494,21 @@ async fn start_workflow(
     let verify_on_complete = optional_bool(&input, "verify", false);
     let run_id = format!("workflow_{}", &Uuid::new_v4().to_string()[..8]);
 
+    // Capture the approved plan envelope for audit/receipt (#4126). Reaching
+    // execute means the approval gate already passed (or YOLO/auto-start).
+    let workflow_cfg = codewhale_config::WorkflowConfigToml::default();
+    let summary = source
+        .spec
+        .as_ref()
+        .map(|spec| analyze_workflow_spec(spec, token_budget, &workflow_cfg))
+        .unwrap_or_else(|| analyze_workflow_plan_approval_with_config(&input, &workflow_cfg));
+    let approval_decision = if summary.is_read_only_envelope() {
+        "auto_read_only"
+    } else {
+        "approved"
+    };
+    let plan_approval = summary.to_receipt(approval_decision, now_ms());
+
     {
         let mut runs_guard = lock_mutex(&state.runs)?;
         let mut record = WorkflowRunRecord::new(
@@ -493,6 +518,7 @@ async fn start_workflow(
             source.spec.as_ref(),
         );
         record.verify_on_complete = verify_on_complete;
+        record.plan_approval = Some(plan_approval.clone());
         let started = WorkflowUiEvent::at(
             record.started_at_ms,
             WorkflowUiEventKind::RunStarted {
@@ -737,6 +763,8 @@ fn workflow_result_for(
         "branch_count": summary.branch_count,
         "control_count": summary.control_count,
         "execution_status": summary.execution_status,
+        // #4126: durable plan-approval receipt for audit/receipt consumers.
+        "plan_approval": record.plan_approval,
     }));
     Ok(result)
 }
@@ -2563,6 +2591,7 @@ mod journal {
                 error: None,
                 verify_on_complete: false,
                 verification: None,
+                plan_approval: None,
             }
         }
 

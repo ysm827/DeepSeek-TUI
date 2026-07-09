@@ -1579,7 +1579,8 @@ fn build_approval_controls(
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
-    for (i, opt) in approval_options_for(risk, locale).iter().enumerate() {
+    let options = approval_options_for_request(request, risk, locale);
+    for (i, opt) in options.iter().enumerate() {
         let is_selected = i == view.selected();
         let label_color = if opt.dangerous {
             accent
@@ -1933,6 +1934,7 @@ fn save_ask_rule_hint(locale: Locale) -> &'static str {
     }
 }
 
+#[derive(Clone)]
 struct ApprovalOptionRow {
     label: Cow<'static, str>,
     key_hint: &'static str,
@@ -1963,6 +1965,61 @@ fn approval_options_for(risk: RiskLevel, locale: Locale) -> [ApprovalOptionRow; 
             dangerous: false,
         },
     ]
+}
+
+/// Workflow elevated-plan card options (#4126): Approve / Edit plan / Cancel.
+fn workflow_approval_options(risk: RiskLevel, locale: Locale) -> [ApprovalOptionRow; 3] {
+    let dangerous = matches!(risk, RiskLevel::Destructive);
+    [
+        ApprovalOptionRow {
+            label: workflow_option_approve(locale),
+            key_hint: "1 / y",
+            dangerous,
+        },
+        ApprovalOptionRow {
+            label: workflow_option_edit_plan(locale),
+            key_hint: "2 / e",
+            dangerous: false,
+        },
+        ApprovalOptionRow {
+            label: workflow_option_cancel(locale),
+            key_hint: "3 / Esc",
+            dangerous: false,
+        },
+    ]
+}
+
+fn approval_options_for_request(
+    request: &ApprovalRequest,
+    risk: RiskLevel,
+    locale: Locale,
+) -> Vec<ApprovalOptionRow> {
+    if request.tool_name == "workflow" {
+        workflow_approval_options(risk, locale).to_vec()
+    } else {
+        approval_options_for(risk, locale).to_vec()
+    }
+}
+
+fn workflow_option_approve(locale: Locale) -> Cow<'static, str> {
+    match locale {
+        Locale::ZhHans => Cow::Borrowed("批准"),
+        _ => Cow::Borrowed("Approve"),
+    }
+}
+
+fn workflow_option_edit_plan(locale: Locale) -> Cow<'static, str> {
+    match locale {
+        Locale::ZhHans => Cow::Borrowed("编辑计划"),
+        _ => Cow::Borrowed("Edit plan"),
+    }
+}
+
+fn workflow_option_cancel(locale: Locale) -> Cow<'static, str> {
+    match locale {
+        Locale::ZhHans => Cow::Borrowed("取消"),
+        _ => Cow::Borrowed("Cancel"),
+    }
 }
 
 fn option_approve_once(locale: Locale) -> Cow<'static, str> {
