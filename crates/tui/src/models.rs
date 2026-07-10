@@ -249,7 +249,7 @@ pub fn context_window_for_model(model: &str) -> Option<u32> {
         }
         return Some(LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS);
     }
-    if is_openai_gpt_55_api_model(&lower) {
+    if is_openai_gpt_55_api_model(&lower) || is_openai_gpt_56_api_model(&lower) {
         return Some(1_050_000);
     }
     if is_openai_codex_model(&lower) {
@@ -275,7 +275,9 @@ fn known_context_window_for_model(model_lower: &str) -> Option<u32> {
         // https://developers.openai.com/api/docs/models/gpt-5.3-codex
         "gpt-5-codex" | "gpt-5.3-codex" => Some(400_000),
         // Anthropic 4.6+ models carry a 1M window; Haiku stays at 200K (#3014).
-        "claude-opus-4-8" | "claude-sonnet-4-6" => Some(1_000_000),
+        "claude-opus-4-8" | "claude-sonnet-4-6" | "claude-sonnet-5" | "claude-fable-5" => {
+            Some(1_000_000)
+        }
         "claude-haiku-4-5" => Some(200_000),
         "trinity-mini" => Some(128_000),
         "arcee-ai/trinity-large-thinking" | "trinity-large-thinking" | "trinity-large-preview" => {
@@ -328,6 +330,7 @@ fn known_context_window_for_model(model_lower: &str) -> Option<u32> {
         "grok-build" => Some(512_000),
         "grok-composer-2.5-fast" => Some(200_000),
         "grok-4.20-0309-reasoning" | "grok-4.20-0309-non-reasoning" => Some(2_000_000),
+        "muse-spark-1.1" => Some(1_000_000),
         _ => None,
     }
 }
@@ -341,13 +344,21 @@ pub fn max_output_tokens_for_model(model: &str) -> Option<u32> {
     if lower.contains("deepseek") && lower.contains("v4") {
         return Some(384_000);
     }
-    if is_openai_gpt_55_api_model(&lower) || is_openai_codex_model(&lower) {
+    if is_openai_gpt_55_api_model(&lower)
+        || is_openai_gpt_56_api_model(&lower)
+        || is_openai_codex_model(&lower)
+    {
         return Some(128_000);
     }
     match lower.as_str() {
         "gpt-5-codex" | "gpt-5.3-codex" => Some(128_000),
-        "claude-opus-4-8" => Some(128_000),
-        "claude-sonnet-4-6" | "claude-haiku-4-5" => Some(64_000),
+        // claude-sonnet-4-6 max output raised 64K -> 128K per
+        // https://platform.claude.com/docs/en/about-claude/models/overview
+        // (2026-07-09 audit).
+        "claude-opus-4-8" | "claude-sonnet-4-6" | "claude-sonnet-5" | "claude-fable-5" => {
+            Some(128_000)
+        }
+        "claude-haiku-4-5" => Some(64_000),
         "arcee-ai/trinity-large-thinking"
         | "trinity-large-thinking"
         | "moonshotai/kimi-k2.7-code"
@@ -375,6 +386,7 @@ pub fn max_output_tokens_for_model(model: &str) -> Option<u32> {
         "nvidia/nemotron-3-ultra-550b-a55b:free" => Some(65_536),
         "google/gemma-4-31b-it" => Some(16_384),
         "google/gemma-4-31b-it:free" | "google/gemma-4-26b-a4b-it:free" => Some(32_768),
+        "muse-spark-1.1" => Some(32_000),
         _ => None,
     }
 }
@@ -398,6 +410,8 @@ pub fn model_supports_reasoning(model: &str) -> bool {
         lower.as_str(),
         "claude-opus-4-8"
             | "claude-sonnet-4-6"
+            | "claude-sonnet-5"
+            | "claude-fable-5"
             | "gpt-5-codex"
             | "gpt-5.3-codex"
             | "arcee-ai/trinity-large-thinking"
@@ -446,20 +460,31 @@ pub fn model_supports_reasoning(model: &str) -> bool {
             | "grok-4.3"
             | "grok-build"
             | "grok-4.20-0309-reasoning"
+            | "muse-spark-1.1"
     ) || is_openai_gpt_55_api_model(&lower)
+        || is_openai_gpt_56_api_model(&lower)
         || is_openai_codex_model(&lower)
 }
 
 #[must_use]
 pub(crate) fn model_is_openai_reasoning_family(model: &str) -> bool {
     let lower = model.to_lowercase();
-    is_openai_gpt_55_api_model(&lower) || is_openai_codex_model(&lower)
+    is_openai_gpt_55_api_model(&lower)
+        || is_openai_gpt_56_api_model(&lower)
+        || is_openai_codex_model(&lower)
 }
 
 fn is_openai_gpt_55_api_model(model_lower: &str) -> bool {
     matches!(model_lower, "gpt-5.5" | "gpt-5.5-pro")
         || has_date_snapshot_suffix(model_lower, "gpt-5.5-")
         || has_date_snapshot_suffix(model_lower, "gpt-5.5-pro-")
+}
+
+pub(crate) fn is_openai_gpt_56_api_model(model_lower: &str) -> bool {
+    matches!(
+        model_lower,
+        "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+    )
 }
 
 fn is_openai_codex_model(model_lower: &str) -> bool {
@@ -711,6 +736,16 @@ mod tests {
 
     #[test]
     fn openai_api_and_codex_models_have_verified_context_metadata() {
+        for model in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(context_window_for_model(model), Some(1_050_000));
+            assert_eq!(max_output_tokens_for_model(model), Some(128_000));
+            assert!(model_supports_reasoning(model));
+            assert_eq!(
+                compaction_threshold_for_model_at_percent(model, 80.0),
+                840_000
+            );
+        }
+
         for model in [
             "gpt-5.5",
             "gpt-5.5-pro",
@@ -750,6 +785,51 @@ mod tests {
         assert_eq!(context_window_for_model("gpt-5.5-nano"), None);
         assert_eq!(max_output_tokens_for_model("gpt-5.5-nano"), None);
         assert!(!model_supports_reasoning("gpt-5.5-nano"));
+    }
+
+    #[test]
+    fn anthropic_stepfun_and_sakana_limits_match_2026_07_09_audit() {
+        // Sonnet 4.6 output cap raised 64K -> 128K per
+        // https://platform.claude.com/docs/en/about-claude/models/overview;
+        // Haiku stays at 64K.
+        assert_eq!(
+            max_output_tokens_for_model("claude-sonnet-4-6"),
+            Some(128_000)
+        );
+        assert_eq!(
+            max_output_tokens_for_model("claude-haiku-4-5"),
+            Some(64_000)
+        );
+        // step-3.7-flash max output is third-party sourced (models.dev +
+        // Artificial Analysis; the official StepFun page is silent):
+        // https://models.dev/models/stepfun/step-3.7-flash/
+        assert_eq!(max_output_tokens_for_model("step-3.7-flash"), Some(256_000));
+        assert_eq!(context_window_for_model("step-3.7-flash"), Some(256_000));
+        // fugu-ultra limits are third-party sourced (Requesty; Sakana's own
+        // >272K price tier at https://console.sakana.ai/pricing confirms the
+        // context window exceeds 272K).
+        for model in ["fugu-ultra", "fugu-ultra-20260615"] {
+            assert_eq!(context_window_for_model(model), Some(1_000_000), "{model}");
+            assert_eq!(max_output_tokens_for_model(model), Some(131_000), "{model}");
+        }
+    }
+
+    #[test]
+    fn claude_fable_5_and_sonnet_5_have_verified_metadata() {
+        // 1M context / 128K output per
+        // https://platform.claude.com/docs/en/about-claude/pricing (2026-07-09).
+        for model in ["claude-fable-5", "claude-sonnet-5"] {
+            assert_eq!(context_window_for_model(model), Some(1_000_000), "{model}");
+            assert_eq!(max_output_tokens_for_model(model), Some(128_000), "{model}");
+            assert!(model_supports_reasoning(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn muse_spark_has_verified_context_and_reasoning_metadata() {
+        assert_eq!(context_window_for_model("muse-spark-1.1"), Some(1_000_000));
+        assert_eq!(max_output_tokens_for_model("muse-spark-1.1"), Some(32_000));
+        assert!(model_supports_reasoning("muse-spark-1.1"));
     }
 
     #[test]

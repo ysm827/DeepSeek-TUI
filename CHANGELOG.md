@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Make the advertised Android/Termux release target buildable by generating
+  QuickJS bindings against the Android NDK instead of expecting an upstream
+  pre-generated `aarch64-linux-android` binding file, and give Android CLI/TUI
+  HTTP clients a preconfigured rustls root store (Mozilla WebPKI roots) so
+  standalone Termux processes stop panicking inside
+  `rustls-platform-verifier`'s JVM expectations (#4236, #4242).
+- Rebalance the bundled Constitution after the v0.8.67 prompt ablation: keep
+  the procedural policy tail in mode-specific layers, while restoring concise
+  behavioral guidance for momentum, causal investigation, constraint-first
+  decisions, mechanism-backed guarantees, and clean continuity.
 - Wire live catalog cache into provider/model pickers without dropping stale or
   prior rows after TTL expiry / refresh failure (#4139). Remove the dead
   `OFFERING_SEEDS` hand table so the bundled Models.dev catalog is the sole
@@ -28,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Wire xAI device-code OAuth into `codewhale auth xai-device`, the TUI
   `/auth xai-device` command, and guided provider setup, with comment-preserving
   auth-mode persistence and loopback exchange coverage (#4257).
+- Add GPT-5.6 Sol, Terra, and Luna to the OpenAI API route, including their
+  1.05M context metadata, 128K output limits, pricing, and `max` reasoning
+  effort. Add Meta Model API as a first-class OpenAI-compatible provider for
+  Muse Spark 1.1 with 1M context, tool/reasoning metadata, provider aliases,
+  and both `META_MODEL_API_KEY` and Meta's `MODEL_API_KEY` credential names.
 - Catalog automation: `scripts/catalog_models_dev.py` refreshes secret-free
   Models.dev / OpenRouter listings and validates the offline seed snapshot
   (`snapshot --check`) without ever persisting API keys (#4117).
