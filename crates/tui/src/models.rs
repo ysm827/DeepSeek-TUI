@@ -516,7 +516,7 @@ fn is_openai_codex_model(model_lower: &str) -> bool {
     )
 }
 
-fn has_date_snapshot_suffix(model_lower: &str, prefix: &str) -> bool {
+pub(crate) fn has_date_snapshot_suffix(model_lower: &str, prefix: &str) -> bool {
     let Some(rest) = model_lower.strip_prefix(prefix) else {
         return false;
     };

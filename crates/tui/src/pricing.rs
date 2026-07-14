@@ -12,7 +12,7 @@ use crate::config::{
     ApiProvider, DEEPSEEK_ALIAS_REPLACEMENT, DEEPSEEK_ALIAS_RETIREMENT_UTC,
     DEFAULT_STEPFUN_BASE_URL, DEFAULT_STEPFUN_MODEL, canonical_model_id_for_provider,
 };
-use crate::models::Usage;
+use crate::models::{Usage, has_date_snapshot_suffix};
 
 /// Cost display currency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -375,6 +375,27 @@ fn usd_pricing(
 }
 
 const MINIMAX_M3_LONG_CONTEXT_THRESHOLD: u32 = 512_000;
+const OPENAI_LONG_CONTEXT_SURCHARGE_THRESHOLD: u32 = 272_000;
+
+/// OpenAI applies a higher price to the full request once these models exceed
+/// 272K input tokens. Until the pricing layer can represent request-wide tiers,
+/// refuse to report the lower static catalog price (#4317).
+/// https://developers.openai.com/api/docs/models/gpt-5.5
+/// https://developers.openai.com/api/docs/models/gpt-5.6-sol
+fn direct_openai_long_context_tier_is_unpriced(
+    provider: ApiProvider,
+    model: &str,
+    input_tokens: u32,
+) -> bool {
+    let model_lower = model.trim().to_ascii_lowercase();
+    let affected_model = matches!(
+        model_lower.as_str(),
+        "gpt-5.5" | "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+    ) || has_date_snapshot_suffix(&model_lower, "gpt-5.5-");
+    provider == ApiProvider::Openai
+        && input_tokens > OPENAI_LONG_CONTEXT_SURCHARGE_THRESHOLD
+        && affected_model
+}
 
 fn minimax_m3_standard_pricing(long_context: bool) -> ModelPricing {
     if long_context {
@@ -549,6 +570,10 @@ pub(crate) fn calculate_turn_cost_estimate_for_provider_at(
     } else {
         canonical_model
     };
+
+    if direct_openai_long_context_tier_is_unpriced(provider, &catalog_model, usage.input_tokens) {
+        return None;
+    }
 
     // MiniMax-M3 doubles its published rates above 512K total input. The
     // catalog row is necessarily static, so retain the usage-aware first-party
@@ -1103,6 +1128,152 @@ mod tests {
     }
 
     #[test]
+    fn direct_openai_long_context_estimates_fail_closed_above_272k() {
+        for model in [
+            "gpt-5.5",
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ] {
+            let at_boundary = Usage {
+                input_tokens: OPENAI_LONG_CONTEXT_SURCHARGE_THRESHOLD,
+                ..Usage::default()
+            };
+            let above_boundary = Usage {
+                input_tokens: OPENAI_LONG_CONTEXT_SURCHARGE_THRESHOLD + 1,
+                ..Usage::default()
+            };
+
+            assert!(
+                calculate_turn_cost_estimate_for_provider(
+                    ApiProvider::Openai,
+                    model,
+                    &at_boundary,
+                )
+                .is_some(),
+                "{model} should retain its standard price at 272K"
+            );
+            assert!(
+                calculate_turn_cost_estimate_for_provider(
+                    ApiProvider::Openai,
+                    model,
+                    &above_boundary,
+                )
+                .is_none(),
+                "{model} must not report the lower static price above 272K"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_long_context_guard_is_exact_and_provider_scoped() {
+        let input_tokens = OPENAI_LONG_CONTEXT_SURCHARGE_THRESHOLD + 1;
+
+        for provider in [
+            ApiProvider::Openrouter,
+            ApiProvider::OpenaiCodex,
+            ApiProvider::Ollama,
+            ApiProvider::Custom,
+        ] {
+            assert!(
+                !direct_openai_long_context_tier_is_unpriced(provider, "gpt-5.5", input_tokens,),
+                "{provider:?} must not inherit direct OpenAI tier handling"
+            );
+        }
+        for model in [
+            "gpt-5.5-pro",
+            "gpt-5.5-pro-2026-04-23",
+            "gpt-5.5-2026-04-23-extra",
+            "openai/gpt-5.5",
+            "gpt-5.6-sol-preview",
+        ] {
+            assert!(
+                !direct_openai_long_context_tier_is_unpriced(
+                    ApiProvider::Openai,
+                    model,
+                    input_tokens,
+                ),
+                "non-documented id {model} must not be treated as an alias"
+            );
+        }
+
+        let usage = Usage {
+            input_tokens,
+            output_tokens: 1,
+            ..Usage::default()
+        };
+        assert!(calculate_turn_cost_estimate_from_usage("gpt-5.5", &usage).is_some());
+        assert!(
+            calculate_turn_cost_estimate_for_provider(ApiProvider::OpenaiCodex, "gpt-5.5", &usage,)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn direct_openai_gpt55_snapshot_uses_the_same_strict_272k_boundary() {
+        let snapshot = "gpt-5.5-2026-04-23";
+
+        assert!(!direct_openai_long_context_tier_is_unpriced(
+            ApiProvider::Openai,
+            snapshot,
+            OPENAI_LONG_CONTEXT_SURCHARGE_THRESHOLD,
+        ));
+        assert!(direct_openai_long_context_tier_is_unpriced(
+            ApiProvider::Openai,
+            snapshot,
+            OPENAI_LONG_CONTEXT_SURCHARGE_THRESHOLD + 1,
+        ));
+
+        let above_boundary = Usage {
+            input_tokens: OPENAI_LONG_CONTEXT_SURCHARGE_THRESHOLD + 1,
+            ..Usage::default()
+        };
+        assert!(
+            calculate_turn_cost_estimate_for_provider(
+                ApiProvider::Openai,
+                snapshot,
+                &above_boundary,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn direct_openai_long_context_guard_uses_total_input_with_mixed_cache_classes() {
+        let at_boundary = Usage {
+            input_tokens: OPENAI_LONG_CONTEXT_SURCHARGE_THRESHOLD,
+            output_tokens: 1_000,
+            prompt_cache_hit_tokens: Some(100_000),
+            prompt_cache_miss_tokens: Some(100_000),
+            prompt_cache_write_tokens: Some(72_000),
+            ..Usage::default()
+        };
+        let above_boundary = Usage {
+            input_tokens: OPENAI_LONG_CONTEXT_SURCHARGE_THRESHOLD + 1,
+            prompt_cache_write_tokens: Some(72_001),
+            ..at_boundary.clone()
+        };
+
+        assert!(
+            calculate_turn_cost_estimate_for_provider(
+                ApiProvider::Openai,
+                "gpt-5.6-sol",
+                &at_boundary,
+            )
+            .is_some()
+        );
+        assert!(
+            calculate_turn_cost_estimate_for_provider(
+                ApiProvider::Openai,
+                "gpt-5.6-sol",
+                &above_boundary,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn minimax_m2_7_preserves_cache_read_and_write_rates() {
         let pricing = pricing_for_model_at("MiniMax-M2.7", Utc::now()).expect("M2.7 pricing");
         assert_eq!(pricing.usd.input_cache_hit_per_million, 0.06);
@@ -1329,10 +1500,10 @@ mod tests {
             OfferingPricing::from_catalog_offering(&offering).expect("catalog pricing");
         assert!(catalog_pricing.cache_write_per_million.is_none());
         let usage = Usage {
-            input_tokens: 1_000_000,
+            input_tokens: 250_000,
             output_tokens: 0,
             prompt_cache_miss_tokens: Some(0),
-            prompt_cache_write_tokens: Some(1_000_000),
+            prompt_cache_write_tokens: Some(250_000),
             ..Default::default()
         };
 
@@ -1344,7 +1515,7 @@ mod tests {
         )
         .expect("provider hand price supplies the missing cache-write class");
 
-        assert!((estimate.usd - 5.0).abs() < f64::EPSILON);
+        assert!((estimate.usd - 1.25).abs() < f64::EPSILON);
         assert_eq!(estimate.cny, 0.0);
     }
 

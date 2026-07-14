@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   engine. Preserve the 262K Kimi route's usable input budget when catalog
   metadata also advertises a 262K output ceiling (#4293 by @SamhandsomeLee,
   #4368).
+- Fail closed instead of reporting base-rate dollar estimates for direct OpenAI
+  GPT-5.5 (including dated non-Pro snapshots) and GPT-5.6 Sol/Terra/Luna
+  requests above 272K input tokens. Exact tiered accounting remains deferred to
+  the generalized pricing schema; Codex subscription and foreign-provider
+  routes are unchanged (#4317).
 - Make offline `scorecard` pricing provider-aware: `turn_end` records carry the
   effective route and a non-secret billing surface, runtime exports and
   supported aliases ingest cleanly, legacy/unknown routes remain explicitly
