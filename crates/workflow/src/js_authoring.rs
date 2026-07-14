@@ -652,6 +652,12 @@ workflow({
             assert!(!leaf.permissions.allow_write);
             assert!(leaf.permissions.allowed_tools.is_empty());
             assert!(
+                leaf.budget
+                    .max_tokens
+                    .is_some_and(|tokens| tokens >= 16_000),
+                "acceptance children need enough budget for the runtime prompt and source reads"
+            );
+            assert!(
                 leaf.profile.is_none(),
                 "Fleet must resolve the declared role"
             );

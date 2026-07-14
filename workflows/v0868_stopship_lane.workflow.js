@@ -63,7 +63,7 @@ export default workflow({
                 "crates/workflow/src/role_resolve.rs",
                 "crates/tui/src/tools/workflow.rs"
               ],
-              "budget": { "max_steps": 12, "timeout_secs": 600, "max_tokens": 6000 }
+              "budget": { "max_steps": 12, "timeout_secs": 600, "max_tokens": 32000 }
             }
           },
           {
@@ -78,7 +78,7 @@ export default workflow({
                 "crates/lane/src/registry.rs",
                 "crates/tui/src/tools/workflow.rs"
               ],
-              "budget": { "max_steps": 10, "timeout_secs": 600, "max_tokens": 5000 }
+              "budget": { "max_steps": 10, "timeout_secs": 600, "max_tokens": 24000 }
             }
           },
           {
@@ -93,7 +93,7 @@ export default workflow({
                 "crates/lane/src/registry.rs",
                 "crates/tui/src/tools/workflow.rs"
               ],
-              "budget": { "max_steps": 10, "timeout_secs": 600, "max_tokens": 5000 }
+              "budget": { "max_steps": 10, "timeout_secs": 600, "max_tokens": 24000 }
             }
           },
           {
@@ -108,7 +108,7 @@ export default workflow({
                 "crates/lane/src/registry.rs",
                 "crates/tui/src/tools/workflow.rs"
               ],
-              "budget": { "max_steps": 10, "timeout_secs": 600, "max_tokens": 5000 }
+              "budget": { "max_steps": 10, "timeout_secs": 600, "max_tokens": 24000 }
             }
           },
           {
@@ -123,7 +123,7 @@ export default workflow({
                 "crates/lane/src/registry.rs",
                 "crates/tui/src/tools/workflow.rs"
               ],
-              "budget": { "max_steps": 8, "timeout_secs": 600, "max_tokens": 4000 }
+              "budget": { "max_steps": 8, "timeout_secs": 600, "max_tokens": 16000 }
             }
           }
         ]
