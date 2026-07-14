@@ -635,15 +635,17 @@ workflow({
         let WorkflowNode::Sequence(sequence) = &workflow.nodes[0] else {
             panic!("acceptance fixture should begin with one ordered role chain");
         };
-        let expected_roles = [
-            "scout",
-            "implementer",
-            "reviewer",
-            "verifier",
-            "release_lead",
+        let expected_children = [
+            ("scout", 8, 480, 16_000),
+            ("implementer", 6, 420, 12_000),
+            ("reviewer", 6, 420, 12_000),
+            ("verifier", 6, 420, 12_000),
+            ("release_lead", 4, 300, 8_000),
         ];
-        assert_eq!(sequence.children.len(), expected_roles.len());
-        for (node, expected_role) in sequence.children.iter().zip(expected_roles) {
+        assert_eq!(sequence.children.len(), expected_children.len());
+        for (node, (expected_role, max_steps, timeout_secs, max_tokens)) in
+            sequence.children.iter().zip(expected_children)
+        {
             let WorkflowNode::Leaf(leaf) = node else {
                 panic!("acceptance role chain must contain only agent leaves");
             };
@@ -652,11 +654,25 @@ workflow({
             assert!(!leaf.permissions.allow_write);
             assert!(leaf.permissions.allowed_tools.is_empty());
             assert!(
-                leaf.budget
-                    .max_tokens
-                    .is_some_and(|tokens| tokens >= 16_000),
-                "acceptance children need enough budget for the runtime prompt and source reads"
+                leaf.prompt.contains(
+                    "first non-empty line of your response must be exactly APPROVE or exactly BLOCK"
+                ),
+                "{expected_role} must declare the host-readable verdict contract"
             );
+            assert!(
+                leaf.prompt.contains("`grep_files` first")
+                    && leaf
+                        .prompt
+                        .contains("`read_file` only on bounded relevant snippets"),
+                "{expected_role} must constrain source reads"
+            );
+            assert_eq!(leaf.budget.max_steps, Some(max_steps), "{expected_role}");
+            assert_eq!(
+                leaf.budget.timeout_secs,
+                Some(timeout_secs),
+                "{expected_role}"
+            );
+            assert_eq!(leaf.budget.max_tokens, Some(max_tokens), "{expected_role}");
             assert!(
                 leaf.profile.is_none(),
                 "Fleet must resolve the declared role"

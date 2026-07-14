@@ -172,10 +172,16 @@ original checkout.
 The ordered chain explicitly exercises `scout`, `implementer`, `reviewer`,
 `verifier`, and `release_lead`. Workflow-owned gates promote each successful
 role output as a lane-scoped handoff and block the next role if the upstream
-child fails. A prose `PASS` or `BLOCK` inside an agent answer is not the gate;
-only the host-emitted `gate_updated` receipt is authoritative. Acceptance needs
-all of these in `lane logs`: role-resolved `task_started` events, passed or
-blocked `gate_updated` events, `run_completed`, and the terminal Lane receipt.
+child fails or returns an exact first-line rejection verdict. Each fixture role
+must begin its response with standalone `APPROVE` or `BLOCK`; the host maps that
+first non-empty line to the gate outcome, while verdict words later in prose do
+not control admission. The host-emitted `gate_updated` receipt remains
+authoritative. Prompts require grep-first, bounded source reads, with per-role
+token caps of 16k/12k/12k/12k/8k from scout through release lead. Those caps
+are structural guardrails, not proof that a live provider run will complete.
+Acceptance needs all of these in `lane logs`: role-resolved `task_started`
+events, passed or blocked `gate_updated` events, `run_completed`, and the
+terminal Lane receipt.
 
 Validate fleet role resolution without launching agents:
 

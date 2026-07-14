@@ -4713,7 +4713,7 @@ reviewer = "reviewer"
 
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 8);
-        let (client, calls) = fake_chat_client("acceptance evidence").await;
+        let (client, calls) = fake_chat_client("APPROVE\nacceptance evidence").await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),

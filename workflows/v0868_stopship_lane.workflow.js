@@ -52,7 +52,7 @@ export default workflow({
           {
             "agent": {
               "id": "scout-runtime",
-              "prompt": "Read the checked-in v0.8.68 orchestration path only. Inspect workflows/v0868_stopship_lane.workflow.js, fleets/v0868-stopship.toml, crates/cli/src/lib.rs, crates/workflow/src/role_resolve.rs, and crates/tui/src/tools/workflow.rs. Report concise path-and-symbol evidence for: the stopship alias, named Fleet loading, role-to-profile resolution, tmux Lane launch, typed task_started receipts, gate_updated receipts, and terminal workflow receipts. Do not edit files, create branches, run shell commands, access GitHub, or infer success where source evidence is absent.",
+              "prompt": "Read the checked-in v0.8.68 orchestration path only. Use `grep_files` first for the named symbols, then use `read_file` only on bounded relevant snippets; never read an entire large source file. Inspect workflows/v0868_stopship_lane.workflow.js, fleets/v0868-stopship.toml, crates/cli/src/lib.rs, crates/workflow/src/role_resolve.rs, and crates/tui/src/tools/workflow.rs. The first non-empty line of your response must be exactly APPROVE or exactly BLOCK. Use APPROVE only when every named source owner is found; otherwise use BLOCK. Follow with concise path-and-symbol evidence for: the stopship alias, named Fleet loading, role-to-profile resolution, tmux Lane launch, typed task_started receipts, gate_updated receipts, and terminal workflow receipts. Do not edit files, create branches, run shell commands, access GitHub, or infer success where source evidence is absent.",
               "agent_type": "explore",
               "role": "scout",
               "mode": "read_only",
@@ -63,13 +63,13 @@ export default workflow({
                 "crates/workflow/src/role_resolve.rs",
                 "crates/tui/src/tools/workflow.rs"
               ],
-              "budget": { "max_steps": 12, "timeout_secs": 600, "max_tokens": 32000 }
+              "budget": { "max_steps": 8, "timeout_secs": 480, "max_tokens": 16000 }
             }
           },
           {
             "agent": {
               "id": "plan-verification",
-              "prompt": "Act as the Fleet implementer role for a verification-only acceptance run. Use the promoted scout source_evidence handoff to produce a no-edit verification plan for #4175/#4177/#4178/#4179. Identify the exact receipt fields that would prove role resolution, gate promotion or blocking, and terminal Lane reconciliation. This is deliberately not an implementation task: do not edit files, create branches, run shell commands, or propose fixes unrelated to missing acceptance evidence.",
+              "prompt": "Act as the Fleet implementer role for a verification-only acceptance run. Use the promoted scout source_evidence handoff to produce a no-edit verification plan for #4175/#4177/#4178/#4179. If source confirmation is needed, use `grep_files` first and `read_file` only on bounded relevant snippets; never read an entire large source file. The first non-empty line of your response must be exactly APPROVE or exactly BLOCK. Use APPROVE only when the plan names concrete receipt fields for role resolution, gate promotion or blocking, and terminal Lane reconciliation; otherwise use BLOCK. This is deliberately not an implementation task: do not edit files, create branches, run shell commands, or propose fixes unrelated to missing acceptance evidence.",
               "agent_type": "implementer",
               "role": "implementer",
               "mode": "read_only",
@@ -78,13 +78,13 @@ export default workflow({
                 "crates/lane/src/registry.rs",
                 "crates/tui/src/tools/workflow.rs"
               ],
-              "budget": { "max_steps": 10, "timeout_secs": 600, "max_tokens": 24000 }
+              "budget": { "max_steps": 6, "timeout_secs": 420, "max_tokens": 12000 }
             }
           },
           {
             "agent": {
               "id": "review-contract",
-              "prompt": "Review the promoted verification_plan handoff against the checked-in runtime. Look specifically for false-green risks: declared role versus resolved profile, gate state versus prose verdict, tmux process exit versus terminal workflow receipt, and a completed Lane with missing child evidence. Return APPROVE only when each claimed receipt has a concrete source owner; otherwise return BLOCK with the missing evidence. Remain read-only and do not run shell commands or edit anything.",
+              "prompt": "Review the promoted verification_plan handoff against the checked-in runtime. Use `grep_files` first for each claimed owner and `read_file` only on bounded relevant snippets; never read an entire large source file. Look specifically for false-green risks: declared role versus resolved profile, gate state versus prose verdict, tmux process exit versus terminal workflow receipt, and a completed Lane with missing child evidence. The first non-empty line of your response must be exactly APPROVE or exactly BLOCK. Use APPROVE only when each claimed receipt has a concrete source owner; otherwise use BLOCK and list the missing evidence. Remain read-only and do not run shell commands or edit anything.",
               "agent_type": "review",
               "role": "reviewer",
               "mode": "read_only",
@@ -93,13 +93,13 @@ export default workflow({
                 "crates/lane/src/registry.rs",
                 "crates/tui/src/tools/workflow.rs"
               ],
-              "budget": { "max_steps": 10, "timeout_secs": 600, "max_tokens": 24000 }
+              "budget": { "max_steps": 6, "timeout_secs": 420, "max_tokens": 12000 }
             }
           },
           {
             "agent": {
               "id": "verify-receipts",
-              "prompt": "Statically verify the promoted review_report against existing tests and receipt serialization. Inspect the Workflow and CLI test modules for role-resolved task_started, gate_updated, run_completed, metadata, and Lane exit-receipt assertions. Return a compact PASS/BLOCK matrix with exact test names or source symbols. Do not run commands, edit files, create build artifacts, or treat this prose verdict as the gate state; the host gate is authoritative.",
+              "prompt": "Statically verify the promoted review_report against existing tests and receipt serialization. Use `grep_files` first for the receipt and test symbols, then use `read_file` only on bounded relevant snippets; never read an entire large source file. Inspect the Workflow and CLI test modules for role-resolved task_started, gate_updated, run_completed, metadata, and Lane exit-receipt assertions. The first non-empty line of your response must be exactly APPROVE or exactly BLOCK. Use APPROVE only when every required receipt has an exact test name or source symbol; otherwise use BLOCK. Follow with a compact evidence matrix. Do not run commands, edit files, or create build artifacts; the host gate interprets the explicit first-line verdict.",
               "agent_type": "verifier",
               "role": "verifier",
               "mode": "read_only",
@@ -108,13 +108,13 @@ export default workflow({
                 "crates/lane/src/registry.rs",
                 "crates/tui/src/tools/workflow.rs"
               ],
-              "budget": { "max_steps": 10, "timeout_secs": 600, "max_tokens": 24000 }
+              "budget": { "max_steps": 6, "timeout_secs": 420, "max_tokens": 12000 }
             }
           },
           {
             "agent": {
               "id": "release-receipt",
-              "prompt": "Use the promoted verification_report handoff to produce the final acceptance receipt for #4175/#4177/#4178/#4179. List the declared Fleet role and resolved profile evidence, every gate state observed, the terminal workflow status required, and any blocker that prevents issue closure. Never claim that source inspection substitutes for a live Lane log. Do not edit, publish, close issues, run shell commands, or mutate the workspace.",
+              "prompt": "Use the promoted verification_report handoff to produce the final acceptance receipt for #4175/#4177/#4178/#4179. If source confirmation is needed, use `grep_files` first and `read_file` only on bounded relevant snippets; never read an entire large source file. The first non-empty line of your response must be exactly APPROVE or exactly BLOCK. Use APPROVE only when the receipt includes declared Fleet role and resolved profile evidence, every observed gate state, and the required terminal workflow status; otherwise use BLOCK and name the closure blocker. Never claim that source inspection substitutes for a live Lane log. Do not edit, publish, close issues, run shell commands, or mutate the workspace.",
               "agent_type": "general",
               "role": "release_lead",
               "mode": "read_only",
@@ -123,7 +123,7 @@ export default workflow({
                 "crates/lane/src/registry.rs",
                 "crates/tui/src/tools/workflow.rs"
               ],
-              "budget": { "max_steps": 8, "timeout_secs": 600, "max_tokens": 16000 }
+              "budget": { "max_steps": 4, "timeout_secs": 300, "max_tokens": 8000 }
             }
           }
         ]
