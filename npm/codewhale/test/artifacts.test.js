@@ -92,9 +92,18 @@ test("linux riscv64 reports the temporary upstream binding blocker", () => {
   });
 });
 
-test("allAssetNames includes every matrix entry", () => {
-  const { allAssetNames, allReleaseAssetNames } = require(ARTIFACTS_PATH);
+test("release asset inventory includes binaries, archives, installer, and manifests", () => {
+  const {
+    allAssetNames,
+    allReleaseAssetNames,
+    BUNDLE_ASSET_NAMES,
+    BUNDLE_CHECKSUM_MANIFEST,
+    CHECKSUM_MANIFEST,
+    checksummedReleaseAssetNames,
+    WINDOWS_INSTALLER_ASSET,
+  } = require(ARTIFACTS_PATH);
   const assetNames = allAssetNames();
+  const releaseAssetNames = allReleaseAssetNames();
   assert.ok(assetNames.includes("codewhale-windows-x64.exe"));
   assert.ok(assetNames.includes("codewhale-tui-windows-x64.exe"));
   assert.ok(assetNames.includes("codew-windows-x64.exe"));
@@ -103,9 +112,17 @@ test("allAssetNames includes every matrix entry", () => {
   assert.ok(assetNames.includes("codewhale-tui-android-arm64"));
   assert.ok(assetNames.includes("codew-android-arm64"));
   assert.ok(!assetNames.includes("codewhale-linux-riscv64"));
-  assert.ok(allReleaseAssetNames().includes("codew-windows-x64.exe"));
-  assert.ok(allReleaseAssetNames().includes("codewhale.bat"));
-  assert.ok(allReleaseAssetNames().includes("codew-android-arm64"));
+  assert.ok(releaseAssetNames.includes("codew-windows-x64.exe"));
+  assert.ok(releaseAssetNames.includes("codewhale.bat"));
+  assert.ok(releaseAssetNames.includes("codew-android-arm64"));
+  for (const bundle of BUNDLE_ASSET_NAMES) {
+    assert.ok(releaseAssetNames.includes(bundle));
+  }
+  assert.ok(releaseAssetNames.includes(WINDOWS_INSTALLER_ASSET));
+  assert.ok(releaseAssetNames.includes(BUNDLE_CHECKSUM_MANIFEST));
+  assert.ok(releaseAssetNames.includes(CHECKSUM_MANIFEST));
+  assert.ok(checksummedReleaseAssetNames().includes(BUNDLE_CHECKSUM_MANIFEST));
+  assert.ok(!checksummedReleaseAssetNames().includes(CHECKSUM_MANIFEST));
 });
 
 test("CNB mirror URLs use the repository that publishes release assets", () => {

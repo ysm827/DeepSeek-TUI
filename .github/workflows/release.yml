@@ -343,8 +343,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p bundles/checksums
-          MANIFEST="bundles/checksums/codewhale-bundles-sha256.txt"
+          mkdir -p bundles
+          # Keep the manifest at the same depth as the archives. The release
+          # upload glob only publishes artifacts/*/*, so nesting this under a
+          # checksums directory silently omits it from the GitHub Release.
+          MANIFEST="bundles/codewhale-bundles-sha256.txt"
           : > "$MANIFEST"
 
           bundle() {
@@ -391,7 +394,12 @@ jobs:
             fi
 
             local archive="codewhale-${platform}${variant:+-}${variant}.${ext}"
-            sha256sum "bundles/${archive}" | awk '{printf "%s  %s\n", $1, $2}' >> "$MANIFEST"
+            local checksum
+            checksum="$(sha256sum "bundles/${archive}" | awk '{print $1}')"
+            # Release users download the archive and manifest into one
+            # directory, so manifest rows must contain the public basename,
+            # not the workflow-internal bundles/ path.
+            printf '%s  %s\n' "$checksum" "$archive" >> "$MANIFEST"
             echo "  Created bundles/${archive}"
           }
 
@@ -585,11 +593,17 @@ jobs:
           # Canonical manifest used by codewhale's `codewhale update` flow.
           manifest="artifacts/checksums/codewhale-artifacts-sha256.txt"
           : > "${manifest}"
+          # softprops/action-gh-release uploads artifacts/*/*. Hash that exact
+          # public file set rather than unpacked bundle internals that never
+          # become release assets.
           while IFS= read -r -d '' file; do
             hash="$(sha256sum "${file}" | awk '{print $1}')"
             base="$(basename "${file}")"
             printf '%s  %s\n' "${hash}" "${base}" >> "${manifest}"
-          done < <(find artifacts -type f ! -path 'artifacts/checksums/*' -print0 | sort -z)
+          done < <(
+            find artifacts -mindepth 2 -maxdepth 2 -type f \
+              ! -path 'artifacts/checksums/*' -print0 | sort -z
+          )
           cat "${manifest}"
       - name: Generate release body from CHANGELOG
         shell: bash

@@ -217,14 +217,16 @@ The publish helper is idempotent for reruns: already-published crate versions ar
 
 `.github/workflows/release.yml` builds these binaries:
 
-- `codewhale-*` CLI binaries for Linux x64/arm64, macOS x64/arm64, and Windows x64
+- `codewhale-*` CLI binaries for Linux x64/arm64, Android arm64, macOS
+  x64/arm64, and Windows x64
 - `codewhale-tui-*` TUI binaries for the same target matrix
 - `codew-*` shortcut binaries for the same target matrix
 - `codewhale.bat` for the Windows npm launcher
+- platform `.tar.gz` / `.zip` archives and `CodeWhaleSetup.exe`
 
-The release job also uploads `codewhale-artifacts-sha256.txt`. The npm installer and
-release verification script both depend on that checksum manifest. The
-authoritative npm-facing asset list lives in
+The release job also uploads `codewhale-artifacts-sha256.txt` and
+`codewhale-bundles-sha256.txt`. The npm installer and release verification
+script depend on those manifests. The authoritative release asset list lives in
 `npm/codewhale/scripts/artifacts.js`.
 
 Before any Cargo or npm publish, prove that the public GitHub Release assets
@@ -237,10 +239,10 @@ belong to the tag commit you are publishing:
 That gate compares the local and remote `vX.Y.Z` tag SHAs, confirms a
 successful `Release` workflow run used that SHA, then runs the npm wrapper's
 release check against the public GitHub asset URLs. The npm check fails if the
-release is missing an npm-facing asset, the checksum manifest omits a required
-binary, or the assets predate the matching release workflow run. If the command
-fails, rerun or repair `release.yml`; do not publish Cargo or npm against stale
-assets.
+release is missing a required binary, archive, installer, or manifest; either
+manifest omits a required row; or the assets predate the matching release
+workflow run. If the command fails, rerun or repair `release.yml`; do not
+publish Cargo or npm against stale assets.
 
 ## npm Wrapper Release
 
@@ -257,9 +259,10 @@ on a workstation with `npm login` and an authenticator app.
 3. Push the version bump to `main`. After the release source is frozen, create
    the matching `vX.Y.Z` tag from `main`; `release.yml` then builds the binary
    matrix and drafts the GitHub Release.
-4. **Wait for the GitHub Release to finalize** with the full npm-facing binary
-   matrix plus `codewhale-artifacts-sha256.txt`. The npm `prepublishOnly` hook
-   (`scripts/verify-release-assets.js`) requires every asset to be present.
+4. **Wait for the GitHub Release to finalize** with the full binary and archive
+   matrix, Windows installer, and both checksum manifests. The npm
+   `prepublishOnly` hook (`scripts/verify-release-assets.js`) requires every
+   asset to be present.
 5. Run the public asset freshness gate from the repo root:
 
 ```bash

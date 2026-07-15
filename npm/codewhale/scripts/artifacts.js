@@ -2,6 +2,18 @@ const path = require("path");
 const os = require("os");
 
 const CHECKSUM_MANIFEST = "codewhale-artifacts-sha256.txt";
+const BUNDLE_CHECKSUM_MANIFEST = "codewhale-bundles-sha256.txt";
+const WINDOWS_INSTALLER_ASSET = "CodeWhaleSetup.exe";
+
+const BUNDLE_ASSET_NAMES = [
+  "codewhale-linux-x64.tar.gz",
+  "codewhale-linux-arm64.tar.gz",
+  "codewhale-android-arm64.tar.gz",
+  "codewhale-macos-x64.tar.gz",
+  "codewhale-macos-arm64.tar.gz",
+  "codewhale-windows-x64.zip",
+  "codewhale-windows-x64-portable.zip",
+];
 
 const ASSET_MATRIX = {
   linux: {
@@ -134,17 +146,31 @@ function allAssetNames() {
 }
 
 function allReleaseAssetNames() {
-  return [...allAssetNames(), CHECKSUM_MANIFEST];
+  return [
+    ...allAssetNames(),
+    ...BUNDLE_ASSET_NAMES,
+    WINDOWS_INSTALLER_ASSET,
+    BUNDLE_CHECKSUM_MANIFEST,
+    CHECKSUM_MANIFEST,
+  ];
+}
+
+function checksummedReleaseAssetNames() {
+  return allReleaseAssetNames().filter((name) => name !== CHECKSUM_MANIFEST);
 }
 
 module.exports = {
   allAssetNames,
   allReleaseAssetNames,
+  BUNDLE_ASSET_NAMES,
+  BUNDLE_CHECKSUM_MANIFEST,
   CHECKSUM_MANIFEST,
+  checksummedReleaseAssetNames,
   checksumManifestUrl,
   detectBinaryNames,
   executableName,
   releaseAssetUrl,
   releaseBaseUrl,
   releaseBinaryDirectory,
+  WINDOWS_INSTALLER_ASSET,
 };
