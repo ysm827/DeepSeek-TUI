@@ -852,6 +852,56 @@ async fn always_rate_limited_chat_client() -> (DeepSeekClient, Arc<AtomicUsize>)
     (client, calls)
 }
 
+async fn always_invalid_request_chat_client() -> (DeepSeekClient, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/{*path}",
+        post({
+            let calls = Arc::clone(&calls);
+            move |Json(_body): Json<Value>| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": {
+                                "message": "model is not supported on this endpoint"
+                            }
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake invalid-request chat server");
+    let addr = listener
+        .local_addr()
+        .expect("fake invalid-request server addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let config = crate::config::Config {
+        api_key: Some("test-key".to_string()),
+        base_url: Some(format!("http://{addr}/v1")),
+        retry: Some(crate::config::RetryConfig {
+            enabled: Some(false),
+            max_retries: Some(0),
+            initial_delay: Some(0.0),
+            max_delay: Some(0.0),
+            exponential_base: Some(1.0),
+        }),
+        ..crate::config::Config::default()
+    };
+    let client = DeepSeekClient::new(&config).expect("fake invalid-request chat client");
+    (client, calls)
+}
+
 fn estimate_tool_description_tokens_conservative(text: &str) -> usize {
     text.chars().count().div_ceil(3)
 }
@@ -2286,6 +2336,223 @@ async fn agent_tool_cancel_stops_running_child() {
 }
 
 #[tokio::test]
+async fn model_wait_cancel_fans_in_once_and_preserves_checkpoint() {
+    use tokio_util::sync::CancellationToken;
+
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 2);
+    let agent_id = "agent_model_wait_cancel".to_string();
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let mut agent = SubAgent::new(
+        agent_id.clone(),
+        SubAgentType::General,
+        "cancel while waiting on provider".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        None,
+        None,
+        input_tx,
+        tmp.path().to_path_buf(),
+        manager.current_session_boot_id.clone(),
+    );
+    agent.checkpoint = Some(make_checkpoint(
+        &agent_id,
+        1,
+        vec![text_message("user", "request in flight")],
+    ));
+    agent.task_handle = Some(tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }));
+
+    let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
+    let (mailbox, mut mailbox_rx) = Mailbox::new(CancellationToken::new());
+    let (event_tx, mut event_rx) = mpsc::channel(8);
+    let mut runtime = runtime_with_depth(1, Some(completion_tx));
+    runtime.mailbox = Some(mailbox);
+    runtime.event_tx = Some(event_tx);
+    agent.terminal_delivery = Some(SubAgentTerminalDeliveryContext::from_runtime(&runtime));
+    manager.agents.insert(agent_id.clone(), agent);
+    manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
+    manager.record_worker_event(
+        &agent_id,
+        AgentWorkerStatus::ModelWait,
+        Some(SUBAGENT_MODEL_WAIT_REASON.to_string()),
+        Some(1),
+        None,
+    );
+
+    let first = manager.cancel_agent(&agent_id).expect("first Stop");
+    let second = manager.cancel_agent(&agent_id).expect("repeated Stop");
+    assert_eq!(first.status, SubAgentStatus::Cancelled);
+    assert_eq!(second.status, SubAgentStatus::Cancelled);
+    assert_eq!(
+        first
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.reason.as_str()),
+        Some("test_checkpoint")
+    );
+
+    let completion = completion_rx
+        .try_recv()
+        .expect("parent cancellation fan-in");
+    assert!(completion.payload.contains(r#""status":"cancelled""#));
+    assert!(completion_rx.try_recv().is_err());
+
+    let terminal_mail = mailbox_rx
+        .drain()
+        .into_iter()
+        .filter(|envelope| {
+            matches!(
+                envelope.message,
+                MailboxMessage::Completed { .. }
+                    | MailboxMessage::Failed { .. }
+                    | MailboxMessage::Interrupted { .. }
+                    | MailboxMessage::Cancelled { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_mail.len(), 1);
+    assert!(matches!(
+        terminal_mail[0].message,
+        MailboxMessage::Cancelled { ref agent_id } if agent_id == "agent_model_wait_cancel"
+    ));
+
+    let complete_events = std::iter::from_fn(|| event_rx.try_recv().ok())
+        .filter(|event| matches!(event, Event::AgentComplete { .. }))
+        .count();
+    assert_eq!(complete_events, 1);
+    let worker = manager.get_worker_record(&agent_id).expect("worker record");
+    assert_eq!(worker.status, AgentWorkerStatus::Cancelled);
+    assert_eq!(
+        worker
+            .events
+            .iter()
+            .filter(|event| event.status.is_terminal())
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn coordination_interrupt_fans_in_once_and_preserves_checkpoint() {
+    use tokio_util::sync::CancellationToken;
+
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 2);
+    let agent_id = "agent_coordination_interrupt".to_string();
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let mut agent = SubAgent::new(
+        agent_id.clone(),
+        SubAgentType::General,
+        "interrupt with a recoverable checkpoint".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        None,
+        None,
+        input_tx,
+        tmp.path().to_path_buf(),
+        manager.current_session_boot_id.clone(),
+    );
+    agent.checkpoint = Some(make_checkpoint(
+        &agent_id,
+        2,
+        vec![text_message("user", "resume this coordinated task")],
+    ));
+    agent.task_handle = Some(tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }));
+
+    let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
+    let (mailbox, mut mailbox_rx) = Mailbox::new(CancellationToken::new());
+    let (event_tx, mut event_rx) = mpsc::channel(8);
+    let mut runtime = runtime_with_depth(1, Some(completion_tx));
+    runtime.mailbox = Some(mailbox);
+    runtime.event_tx = Some(event_tx);
+    agent.terminal_delivery = Some(SubAgentTerminalDeliveryContext::from_runtime(&runtime));
+    manager.agents.insert(agent_id.clone(), agent);
+    manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
+    manager.record_worker_event(
+        &agent_id,
+        AgentWorkerStatus::RunningTool,
+        Some("step 2/8: running tool 'read_file'".to_string()),
+        Some(2),
+        Some("read_file".to_string()),
+    );
+
+    let reason = "parent rerouted this lane".to_string();
+    let (prior, first) = manager
+        .interrupt_child(&agent_id, Some("agent_parent"), reason.clone())
+        .expect("first coordination interrupt");
+    let (_, second) = manager
+        .interrupt_child(&agent_id, Some("agent_parent"), reason.clone())
+        .expect("repeated coordination interrupt");
+    assert_eq!(prior.status, SubAgentStatus::Running);
+    assert!(matches!(
+        first.status,
+        SubAgentStatus::Interrupted(ref actual) if actual == &reason
+    ));
+    assert_eq!(second.status, first.status);
+    assert_eq!(
+        first
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| (checkpoint.reason.as_str(), checkpoint.steps_taken)),
+        Some(("test_checkpoint", 2))
+    );
+
+    let completion = completion_rx
+        .try_recv()
+        .expect("parent interruption fan-in");
+    assert!(completion.payload.contains(r#""status":"interrupted""#));
+    assert!(completion.payload.contains(&reason));
+    assert!(completion_rx.try_recv().is_err());
+
+    let terminal_mail = mailbox_rx
+        .drain()
+        .into_iter()
+        .filter(|envelope| {
+            matches!(
+                envelope.message,
+                MailboxMessage::Completed { .. }
+                    | MailboxMessage::Failed { .. }
+                    | MailboxMessage::Interrupted { .. }
+                    | MailboxMessage::Cancelled { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_mail.len(), 1);
+    assert!(matches!(
+        terminal_mail[0].message,
+        MailboxMessage::Interrupted {
+            ref agent_id,
+            ref reason
+        } if agent_id == "agent_coordination_interrupt" && reason == "parent rerouted this lane"
+    ));
+
+    let complete_events = std::iter::from_fn(|| event_rx.try_recv().ok())
+        .filter(|event| matches!(event, Event::AgentComplete { .. }))
+        .count();
+    assert_eq!(complete_events, 1);
+    let worker = manager.get_worker_record(&agent_id).expect("worker record");
+    assert_eq!(worker.status, AgentWorkerStatus::WaitingForUser);
+    assert_eq!(
+        worker
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.status,
+                    AgentWorkerStatus::WaitingForUser | AgentWorkerStatus::Interrupted
+                )
+            })
+            .count(),
+        1,
+        "repeated interrupt must not append a second terminal or parked outcome"
+    );
+}
+
+#[tokio::test]
 async fn late_completion_does_not_overwrite_cancelled_outcome() {
     let tmp = tempdir().expect("tempdir");
     let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 2);
@@ -3567,6 +3834,8 @@ async fn admission_limit_counts_queued_and_running_workers_separately() {
 
 #[tokio::test]
 async fn cleanup_auto_cancels_stale_running_agent_and_releases_slot() {
+    use tokio_util::sync::CancellationToken;
+
     let mut manager = SubAgentManager::new(PathBuf::from("."), 1)
         .with_running_heartbeat_timeout(Duration::from_millis(1));
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
@@ -3586,7 +3855,15 @@ async fn cleanup_auto_cancels_stale_running_agent_and_releases_slot() {
         tokio::time::sleep(Duration::from_secs(60)).await;
     }));
     let agent_id = agent.id.clone();
+    let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
+    let (mailbox, mut mailbox_rx) = Mailbox::new(CancellationToken::new());
+    let (event_tx, mut event_rx) = mpsc::channel(8);
+    let mut runtime = runtime_with_depth(1, Some(completion_tx));
+    runtime.mailbox = Some(mailbox);
+    runtime.event_tx = Some(event_tx);
+    agent.terminal_delivery = Some(SubAgentTerminalDeliveryContext::from_runtime(&runtime));
     manager.agents.insert(agent_id.clone(), agent);
+    manager.register_worker(make_worker_spec(&agent_id, PathBuf::from(".")));
     tokio::time::sleep(Duration::from_millis(5)).await;
 
     assert_eq!(
@@ -3607,6 +3884,28 @@ async fn cleanup_auto_cancels_stale_running_agent_and_releases_slot() {
             .as_deref()
             .unwrap_or_default()
             .contains("Auto-cancelled")
+    );
+    let completion = completion_rx
+        .try_recv()
+        .expect("stale cleanup should wake the immediate parent");
+    assert_eq!(completion.agent_id, agent_id);
+    assert!(completion.payload.contains(r#""status":"cancelled""#));
+    assert!(completion_rx.try_recv().is_err());
+    assert!(matches!(
+        mailbox_rx.drain().as_slice(),
+        [MailboxEnvelope {
+            message: MailboxMessage::Cancelled { agent_id: id },
+            ..
+        }] if id == &agent_id
+    ));
+    assert!(matches!(
+        event_rx.try_recv(),
+        Ok(Event::AgentComplete { id, result })
+            if id == agent_id && result.contains(r#""status":"cancelled""#)
+    ));
+    assert_eq!(
+        manager.get_worker_record(&agent_id).unwrap().status,
+        AgentWorkerStatus::Cancelled
     );
 }
 
@@ -3936,6 +4235,179 @@ fn persist_and_reload_preserves_checkpoint_for_interrupted_running_agent() {
     assert_eq!(checkpoint.steps_taken, 2);
     assert_eq!(checkpoint.messages.len(), 2);
     assert_eq!(message_text(&checkpoint.messages[1]), "partial progress");
+}
+
+#[test]
+fn restart_reconciles_every_orphan_execution_status_once_and_preserves_receipts() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().to_path_buf();
+    let state_path = default_state_path(tmp.path()).expect("default state path");
+    let mut manager =
+        SubAgentManager::new(workspace.clone(), 8).with_state_path(state_path.clone());
+
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let mut running = SubAgent::new(
+        "agent_restart_model_wait".to_string(),
+        SubAgentType::General,
+        "resume after restart".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        None,
+        None,
+        input_tx,
+        workspace.clone(),
+        "boot_before_restart".to_string(),
+    );
+    running.checkpoint = Some(make_checkpoint(
+        &running.id,
+        3,
+        vec![
+            text_message("user", "original assignment"),
+            text_message("assistant", "partial checkpoint"),
+        ],
+    ));
+    manager.agents.insert(running.id.clone(), running);
+
+    let orphan_statuses = [
+        ("agent_restart_queued", AgentWorkerStatus::Queued),
+        ("agent_restart_starting", AgentWorkerStatus::Starting),
+        ("agent_restart_running", AgentWorkerStatus::Running),
+        ("agent_restart_model_wait", AgentWorkerStatus::ModelWait),
+        ("agent_restart_running_tool", AgentWorkerStatus::RunningTool),
+    ];
+    for (worker_id, status) in orphan_statuses {
+        manager.register_worker(make_worker_spec(worker_id, workspace.clone()));
+        if status != AgentWorkerStatus::Starting {
+            manager.record_worker_event(
+                worker_id,
+                status,
+                Some(agent_worker_status_name(status).to_string()),
+                Some(3),
+                None,
+            );
+        }
+    }
+
+    manager.register_worker(make_worker_spec("agent_restart_waiting", workspace.clone()));
+    manager.record_worker_event(
+        "agent_restart_waiting",
+        AgentWorkerStatus::WaitingForUser,
+        Some("waiting for user follow-up".to_string()),
+        Some(2),
+        None,
+    );
+    manager.register_worker(make_worker_spec(
+        "agent_restart_completed",
+        workspace.clone(),
+    ));
+    let mut completed = make_snapshot(SubAgentStatus::Completed);
+    completed.agent_id = "agent_restart_completed".to_string();
+    completed.name = completed.agent_id.clone();
+    completed.result = Some("durable terminal receipt".to_string());
+    manager.complete_worker_from_result(&completed.agent_id, &completed);
+    let waiting_events = manager
+        .get_worker_record("agent_restart_waiting")
+        .unwrap()
+        .events;
+    let completed_events = manager
+        .get_worker_record("agent_restart_completed")
+        .unwrap()
+        .events;
+
+    manager
+        .persist_state()
+        .expect("persist restart fixture")
+        .join()
+        .expect("persist thread");
+
+    let mut reloaded =
+        SubAgentManager::new(workspace.clone(), 8).with_state_path(state_path.clone());
+    reloaded.load_state().expect("load restart fixture");
+
+    let restored = reloaded
+        .get_result("agent_restart_model_wait")
+        .expect("restored agent");
+    assert!(matches!(
+        restored.status,
+        SubAgentStatus::Interrupted(ref reason) if reason == SUBAGENT_RESTART_REASON
+    ));
+    let checkpoint = restored.checkpoint.expect("checkpoint survives restart");
+    assert_eq!(checkpoint.steps_taken, 3);
+    assert_eq!(message_text(&checkpoint.messages[1]), "partial checkpoint");
+
+    for (worker_id, _) in orphan_statuses {
+        let worker = reloaded
+            .get_worker_record(worker_id)
+            .expect("orphan worker");
+        assert_eq!(worker.status, AgentWorkerStatus::Interrupted, "{worker_id}");
+        assert_eq!(
+            worker
+                .events
+                .iter()
+                .filter(|event| event.status == AgentWorkerStatus::Interrupted)
+                .count(),
+            1,
+            "{worker_id} gets one restart terminal receipt"
+        );
+    }
+    assert_eq!(
+        reloaded
+            .get_worker_record("agent_restart_waiting")
+            .unwrap()
+            .events,
+        waiting_events,
+        "waiting-for-user is not an orphan execution state"
+    );
+    assert_eq!(
+        reloaded
+            .get_worker_record("agent_restart_completed")
+            .unwrap()
+            .events,
+        completed_events,
+        "terminal receipts remain byte-for-byte intact"
+    );
+
+    let event_counts = orphan_statuses.map(|(worker_id, _)| {
+        reloaded
+            .get_worker_record(worker_id)
+            .expect("reconciled worker")
+            .events
+            .len()
+    });
+    assert_eq!(
+        reloaded.reconcile_orphaned_workers_after_restart(),
+        0,
+        "repeat reconciliation is idempotent"
+    );
+    assert_eq!(
+        orphan_statuses.map(|(worker_id, _)| {
+            reloaded
+                .get_worker_record(worker_id)
+                .expect("reconciled worker")
+                .events
+                .len()
+        }),
+        event_counts
+    );
+
+    reloaded
+        .persist_state()
+        .expect("persist reconciled state")
+        .join()
+        .expect("persist thread");
+    let mut loaded_again = SubAgentManager::new(workspace, 8).with_state_path(state_path);
+    loaded_again.load_state().expect("load reconciled state");
+    assert_eq!(
+        orphan_statuses.map(|(worker_id, _)| {
+            loaded_again
+                .get_worker_record(worker_id)
+                .expect("persisted reconciled worker")
+                .events
+                .len()
+        }),
+        event_counts,
+        "a later restart does not append duplicate interrupted receipts"
+    );
 }
 
 #[cfg(unix)]
@@ -6272,11 +6744,12 @@ async fn run_subagent_task_claims_before_delivery_and_then_finalizes() {
         "boot_test".to_string(),
     );
     agent.status = SubAgentStatus::Running;
-    manager.write().await.agents.insert(agent_id.clone(), agent);
 
     let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
     let mut runtime = runtime_with_depth(1, Some(completion_tx));
     runtime.manager = Arc::clone(&manager);
+    agent.terminal_delivery = Some(SubAgentTerminalDeliveryContext::from_runtime(&runtime));
+    manager.write().await.agents.insert(agent_id.clone(), agent);
 
     let task = SubAgentTask {
         manager_handle: manager.clone(),
@@ -6331,7 +6804,7 @@ async fn run_subagent_task_claims_before_delivery_and_then_finalizes() {
 }
 
 #[tokio::test]
-async fn run_subagent_task_suppresses_external_completion_when_cancellation_wins() {
+async fn cancellation_wins_task_race_but_still_fans_in_exactly_once() {
     use tokio_util::sync::CancellationToken;
 
     let tmp = tempdir().expect("tempdir");
@@ -6362,6 +6835,7 @@ async fn run_subagent_task_suppresses_external_completion_when_cancellation_wins
     runtime.manager = Arc::clone(&manager);
     runtime.mailbox = Some(mailbox);
     runtime.event_tx = Some(event_tx);
+    agent.terminal_delivery = Some(SubAgentTerminalDeliveryContext::from_runtime(&runtime));
 
     let task = SubAgentTask {
         manager_handle: manager.clone(),
@@ -6411,36 +6885,57 @@ async fn run_subagent_task_suppresses_external_completion_when_cancellation_wins
         Some("Cancelled by parent request.")
     );
 
+    let completion = completion_rx
+        .try_recv()
+        .expect("winning cancellation must wake the immediate parent");
+    assert_eq!(completion.agent_id, agent_id);
+    assert!(completion.payload.contains(r#""status":"cancelled""#));
     assert!(
         completion_rx.try_recv().is_err(),
-        "cancelled task must not wake the parent with a late completion"
+        "late task output must not publish a second parent completion"
     );
-    assert!(
-        mailbox_rx.drain().into_iter().all(|envelope| !matches!(
-            envelope.message,
-            MailboxMessage::Completed { agent_id: ref id, .. }
-                | MailboxMessage::Failed { agent_id: ref id, .. }
-                if id == &agent_id
-        )),
-        "cancelled task must not publish a late terminal mailbox result"
-    );
-    while let Ok(event) = event_rx.try_recv() {
-        assert!(
-            !matches!(event, Event::AgentComplete { id, .. } if id == agent_id),
-            "cancelled task must not publish a late AgentComplete event"
-        );
-    }
+
+    let terminal_mail = mailbox_rx
+        .drain()
+        .into_iter()
+        .filter(|envelope| {
+            matches!(
+                envelope.message,
+                MailboxMessage::Completed { .. }
+                    | MailboxMessage::Failed { .. }
+                    | MailboxMessage::Interrupted { .. }
+                    | MailboxMessage::Cancelled { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_mail.len(), 1);
+    assert!(matches!(
+        terminal_mail[0].message,
+        MailboxMessage::Cancelled { ref agent_id } if agent_id == &snapshot.agent_id
+    ));
+
+    let terminal_events = std::iter::from_fn(|| event_rx.try_recv().ok())
+        .filter(|event| matches!(event, Event::AgentComplete { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_events.len(), 1);
+    assert!(matches!(
+        &terminal_events[0],
+        Event::AgentComplete { id, result }
+            if id == &snapshot.agent_id && result.contains(r#""status":"cancelled""#)
+    ));
 }
 
 #[tokio::test]
-async fn precommitted_provider_interruption_wakes_parent_without_overriding_cancellation() {
+async fn non_retryable_provider_failure_fans_in_to_every_terminal_sink() {
+    use tokio_util::sync::CancellationToken;
+
     let tmp = tempdir().expect("tempdir");
     let manager = Arc::new(RwLock::new(SubAgentManager::new(
         tmp.path().to_path_buf(),
         2,
     )));
-    let (task_input_tx, _task_input_rx) = mpsc::unbounded_channel();
-    let agent_id = "agent_precommitted_interruption".to_string();
+    let (task_input_tx, task_input_rx) = mpsc::unbounded_channel();
+    let agent_id = "agent_fatal_provider_failure".to_string();
     let mut agent = SubAgent::new(
         agent_id.clone(),
         SubAgentType::General,
@@ -6453,46 +6948,93 @@ async fn precommitted_provider_interruption_wakes_parent_without_overriding_canc
         tmp.path().to_path_buf(),
         "boot_test".to_string(),
     );
-    agent.status = SubAgentStatus::Interrupted("provider stream ended".to_string());
-    manager.write().await.agents.insert(agent_id.clone(), agent);
 
     let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
-    let runtime = runtime_with_depth(1, Some(completion_tx));
-    let result_status = SubAgentStatus::Interrupted("provider stream ended".to_string());
-    assert!(
-        emit_precommitted_interruption_completion(
-            &runtime,
-            &manager,
-            &agent_id,
-            &result_status,
-            "interrupted payload",
-        )
-        .await
-    );
-    let completion = completion_rx
-        .recv()
-        .await
-        .expect("workflow parent should receive the interruption");
-    assert_eq!(completion.agent_id, agent_id);
+    let (mailbox, mut mailbox_rx) = Mailbox::new(CancellationToken::new());
+    let (event_tx, mut event_rx) = mpsc::channel(8);
+    let (client, calls) = always_invalid_request_chat_client().await;
+    let mut runtime = runtime_with_depth(1, Some(completion_tx));
+    runtime.client = client;
+    runtime.manager = Arc::clone(&manager);
+    runtime.context = ToolContext::new(tmp.path());
+    runtime.mailbox = Some(mailbox);
+    runtime.event_tx = Some(event_tx);
+    agent.terminal_delivery = Some(SubAgentTerminalDeliveryContext::from_runtime(&runtime));
+    {
+        let mut manager = manager.write().await;
+        manager.agents.insert(agent_id.clone(), agent);
+        manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
+    }
 
-    manager
-        .write()
-        .await
-        .agents
-        .get_mut(&agent_id)
-        .expect("agent")
-        .status = SubAgentStatus::Cancelled;
-    assert!(
-        !emit_precommitted_interruption_completion(
-            &runtime,
-            &manager,
-            &agent_id,
-            &result_status,
-            "late interruption",
-        )
-        .await
+    run_subagent_task(SubAgentTask {
+        manager_handle: Arc::clone(&manager),
+        runtime,
+        agent_id: agent_id.clone(),
+        agent_type: SubAgentType::General,
+        prompt: "Request a model response".to_string(),
+        assignment: make_assignment(),
+        allowed_tools: Some(Vec::new()),
+        fork_context: false,
+        started_at: Instant::now(),
+        max_steps: 1,
+        token_budget: None,
+        wall_time: DEFAULT_CHILD_WALL_TIME,
+        input_rx: task_input_rx,
+        launch_gate: None,
+    })
+    .await;
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "invalid requests are fatal and must not retry"
     );
+    let completion = completion_rx.try_recv().expect("parent failure fan-in");
+    assert_eq!(completion.agent_id, agent_id);
+    assert!(completion.payload.contains(r#""status":"failed""#));
     assert!(completion_rx.try_recv().is_err());
+    let terminal_mail = mailbox_rx
+        .drain()
+        .into_iter()
+        .filter(|envelope| {
+            matches!(
+                envelope.message,
+                MailboxMessage::Completed { .. }
+                    | MailboxMessage::Failed { .. }
+                    | MailboxMessage::Interrupted { .. }
+                    | MailboxMessage::Cancelled { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        terminal_mail.as_slice(),
+        [MailboxEnvelope {
+            message: MailboxMessage::Failed { agent_id: id, .. },
+            ..
+        }] if id == &agent_id
+    ));
+    let complete_events = std::iter::from_fn(|| event_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            Event::AgentComplete { id, result } => Some((id, result)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        complete_events.as_slice(),
+        [(id, result)] if id == &agent_id && result.contains(r#""status":"failed""#)
+    ));
+
+    let manager = manager.read().await;
+    let snapshot = manager.get_result(&agent_id).expect("failed snapshot");
+    assert!(matches!(snapshot.status, SubAgentStatus::Failed(_)));
+    assert_eq!(
+        snapshot.checkpoint.as_ref().map(|cp| cp.steps_taken),
+        Some(1)
+    );
+    assert_eq!(
+        manager.get_worker_record(&agent_id).unwrap().status,
+        AgentWorkerStatus::Failed
+    );
 }
 
 #[test]

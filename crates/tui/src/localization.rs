@@ -793,6 +793,10 @@ pub enum MessageId {
     // Notifications (turn/agent completion).
     NotificationTurnComplete,
     NotificationSubagentComplete,
+    NotificationSubagentFailed,
+    NotificationSubagentInterrupted,
+    NotificationSubagentCancelled,
+    NotificationSubagentBudgetExhausted,
     // Footer chips.
     FooterWorkedChip,
     // Fleet setup wizard.
@@ -1706,6 +1710,10 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::VoiceTranscribed,
     MessageId::NotificationTurnComplete,
     MessageId::NotificationSubagentComplete,
+    MessageId::NotificationSubagentFailed,
+    MessageId::NotificationSubagentInterrupted,
+    MessageId::NotificationSubagentCancelled,
+    MessageId::NotificationSubagentBudgetExhausted,
     MessageId::FooterWorkedChip,
     MessageId::FleetDraftTitle,
     MessageId::FleetDraftHeader,

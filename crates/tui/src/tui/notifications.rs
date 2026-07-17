@@ -619,6 +619,7 @@ pub fn humanize_duration(d: Duration) -> String {
 
 use crate::localization::{Locale, MessageId, tr};
 use crate::models::{ContentBlock, Message};
+use crate::tools::subagent::SubAgentStatus;
 use crate::tui::app::App;
 
 /// Resolve the effective notification method/threshold/include-summary tuple
@@ -691,13 +692,15 @@ pub fn completed_turn_message(
     msg
 }
 
-/// Compose a notification body for a sub-agent completion. Falls back
-/// to a generic "sub-agent X complete" if no human-readable line can
-/// be teased out of the child's transcript.
-pub fn subagent_completion_message(
+/// Compose a notification body for a terminal sub-agent outcome. Falls back
+/// to the agent id if no human-readable line can be teased out of the child's
+/// transcript. The heading reflects the actual status so a Stop/failed worker
+/// is never announced as successfully complete (#4408).
+pub fn subagent_terminal_message(
     locale: Locale,
     id: &str,
     result: &str,
+    status: &SubAgentStatus,
     include_summary: bool,
     elapsed: Duration,
 ) -> String {
@@ -705,12 +708,15 @@ pub fn subagent_completion_message(
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with("<codewhale:subagent.done>"));
-    let mut msg = completion_status(
-        &tr(locale, MessageId::NotificationSubagentComplete),
-        include_summary,
-        elapsed,
-        None,
-    );
+    let label = match status {
+        SubAgentStatus::Completed => MessageId::NotificationSubagentComplete,
+        SubAgentStatus::Failed(_) => MessageId::NotificationSubagentFailed,
+        SubAgentStatus::Interrupted(_) => MessageId::NotificationSubagentInterrupted,
+        SubAgentStatus::Cancelled => MessageId::NotificationSubagentCancelled,
+        SubAgentStatus::BudgetExhausted => MessageId::NotificationSubagentBudgetExhausted,
+        SubAgentStatus::Running => MessageId::NotificationSubagentComplete,
+    };
+    let mut msg = completion_status(&tr(locale, label), include_summary, elapsed, None);
     let detail = result_line
         .and_then(text_summary)
         .map(|summary| format!("{id}: {summary}"))

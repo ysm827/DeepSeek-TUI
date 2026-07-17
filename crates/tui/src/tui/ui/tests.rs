@@ -7204,6 +7204,21 @@ fn subagent_status_from_completion_result_maps_terminal_sentinels() {
 }
 
 #[test]
+fn agent_complete_terminal_verb_is_truthful_for_cancelled_workers() {
+    let cancelled = subagent_status_from_completion_result(
+        r#"Cancelled
+<codewhale:subagent.done>{"agent_id":"agent_x","status":"cancelled"}</codewhale:subagent.done>"#,
+    );
+
+    assert_eq!(subagent_terminal_verb(&cancelled), "cancelled");
+    assert_ne!(subagent_terminal_verb(&cancelled), "completed");
+    assert_eq!(
+        subagent_terminal_verb(&crate::tools::subagent::SubAgentStatus::Completed),
+        "completed"
+    );
+}
+
+#[test]
 fn subagent_terminal_projection_from_mailbox_maps_terminal_messages() {
     let completed = crate::tools::subagent::MailboxMessage::Completed {
         agent_id: "agent_done".to_string(),
@@ -15588,10 +15603,11 @@ fn completed_turn_notification_leads_with_user_locale() {
 
 #[test]
 fn subagent_completion_notification_uses_summary_line_not_sentinel() {
-    let msg = crate::tui::notifications::subagent_completion_message(
+    let msg = crate::tui::notifications::subagent_terminal_message(
         crate::localization::Locale::En,
         "agent_live",
         "Finished the docs audit.\n<codewhale:subagent.done>{}</codewhale:subagent.done>",
+        &crate::tools::subagent::SubAgentStatus::Completed,
         false,
         Duration::from_secs(42),
     );
@@ -15605,15 +15621,31 @@ fn subagent_completion_notification_uses_summary_line_not_sentinel() {
 
 #[test]
 fn subagent_completion_notification_can_include_elapsed_summary() {
-    let msg = crate::tui::notifications::subagent_completion_message(
+    let msg = crate::tui::notifications::subagent_terminal_message(
         crate::localization::Locale::En,
         "agent_live",
         "",
+        &crate::tools::subagent::SubAgentStatus::Completed,
         true,
         Duration::from_secs(65),
     );
 
     assert_eq!(msg, "Sub-agent complete (1m 5s)\nagent_live");
+}
+
+#[test]
+fn subagent_cancelled_notification_never_claims_completion() {
+    let msg = crate::tui::notifications::subagent_terminal_message(
+        crate::localization::Locale::En,
+        "agent_stopped",
+        "Cancelled\n<codewhale:subagent.done>{\"status\":\"cancelled\"}</codewhale:subagent.done>",
+        &crate::tools::subagent::SubAgentStatus::Cancelled,
+        false,
+        Duration::from_secs(2),
+    );
+
+    assert_eq!(msg, "Sub-agent cancelled\nagent_stopped: Cancelled");
+    assert!(!msg.contains("Sub-agent complete"));
 }
 
 #[test]

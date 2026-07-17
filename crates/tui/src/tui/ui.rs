@@ -1423,6 +1423,17 @@ fn subagent_status_from_completion_result(result: &str) -> SubAgentStatus {
     }
 }
 
+fn subagent_terminal_verb(status: &SubAgentStatus) -> &'static str {
+    match status {
+        SubAgentStatus::Completed => "completed",
+        SubAgentStatus::Interrupted(_) => "interrupted",
+        SubAgentStatus::Failed(_) => "failed",
+        SubAgentStatus::Cancelled => "cancelled",
+        SubAgentStatus::BudgetExhausted => "exhausted its budget",
+        SubAgentStatus::Running => "finished",
+    }
+}
+
 fn subagent_terminal_projection_from_mailbox(
     message: &MailboxMessage,
 ) -> Option<(&str, SubAgentStatus, Option<String>)> {
@@ -3376,16 +3387,17 @@ async fn run_event_loop(
                         app.agent_progress.remove(&id);
                         app.agent_progress_meta.remove(&id);
                         let terminal_status = subagent_status_from_completion_result(&result);
+                        let terminal_verb = subagent_terminal_verb(&terminal_status);
                         apply_subagent_terminal_projection(
                             app,
                             &id,
-                            terminal_status,
+                            terminal_status.clone(),
                             Some(summarize_tool_output(&result)),
                         );
                         // #3030: stable label with raw-id fallback.
                         let label = app.agent_display_label(&id);
                         app.status_message = Some(format!(
-                            "{label} completed: {}",
+                            "{label} {terminal_verb}: {}",
                             summarize_tool_output(&result)
                         ));
                         let should_recapture_terminal =
@@ -3401,10 +3413,11 @@ async fn run_event_loop(
                             notifications::settings(config)
                         {
                             let in_tmux = std::env::var("TMUX").is_ok_and(|v| !v.is_empty());
-                            let msg = notifications::subagent_completion_message(
+                            let msg = notifications::subagent_terminal_message(
                                 app.ui_locale,
                                 &id,
                                 &result,
+                                &terminal_status,
                                 include_summary,
                                 subagent_elapsed,
                             );

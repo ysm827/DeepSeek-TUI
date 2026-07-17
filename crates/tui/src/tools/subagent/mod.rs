@@ -1672,6 +1672,88 @@ pub struct SubAgentCompletion {
     pub payload: String,
 }
 
+/// Live-only sinks needed to publish one terminal child outcome.
+///
+/// This deliberately lives on [`SubAgent`] rather than the persisted worker
+/// record: channels are process-local capabilities and must never cross a
+/// restart boundary. Keeping the immediate-parent sender here lets explicit
+/// Stop and stale cleanup use the same claim -> deliver -> commit path as a
+/// natural task exit instead of aborting the only future that knew how to wake
+/// the parent (#4408).
+#[derive(Clone)]
+struct SubAgentTerminalDeliveryContext {
+    spawn_depth: u32,
+    parent_completion_tx: Option<mpsc::UnboundedSender<SubAgentCompletion>>,
+    mailbox: Option<Mailbox>,
+    event_tx: Option<mpsc::Sender<Event>>,
+}
+
+impl SubAgentTerminalDeliveryContext {
+    fn from_runtime(runtime: &SubAgentRuntime) -> Self {
+        Self {
+            spawn_depth: runtime.spawn_depth,
+            parent_completion_tx: runtime.parent_completion_tx.clone(),
+            mailbox: runtime.mailbox.clone(),
+            event_tx: runtime.event_tx.clone(),
+        }
+    }
+
+    /// Publish to every live sink without blocking or awaiting while the
+    /// manager owns the terminal claim. The public agent/worker states remain
+    /// Running until all three sends have been attempted.
+    fn deliver(&self, result: &SubAgentResult) {
+        let completion = subagent_completion_from_result(result);
+
+        if self.spawn_depth > 0
+            && let Some(tx) = self.parent_completion_tx.as_ref()
+        {
+            let _ = tx.send(completion.clone());
+        }
+
+        if let Some(mailbox) = self.mailbox.as_ref() {
+            let _ = mailbox.send(terminal_mailbox_message(result));
+        }
+
+        if let Some(event_tx) = self.event_tx.as_ref() {
+            let _ = event_tx.try_send(Event::AgentComplete {
+                id: result.agent_id.clone(),
+                result: completion.payload,
+            });
+        }
+    }
+}
+
+fn terminal_mailbox_message(result: &SubAgentResult) -> MailboxMessage {
+    match &result.status {
+        SubAgentStatus::Completed => {
+            let (summary, _) = stamp_subagent_summary(&summarize_subagent_result(result));
+            MailboxMessage::Completed {
+                agent_id: result.agent_id.clone(),
+                summary,
+            }
+        }
+        SubAgentStatus::Interrupted(reason) => MailboxMessage::Interrupted {
+            agent_id: result.agent_id.clone(),
+            reason: reason.clone(),
+        },
+        SubAgentStatus::Failed(error) => MailboxMessage::Failed {
+            agent_id: result.agent_id.clone(),
+            error: error.clone(),
+        },
+        SubAgentStatus::Cancelled => MailboxMessage::Cancelled {
+            agent_id: result.agent_id.clone(),
+        },
+        SubAgentStatus::BudgetExhausted => MailboxMessage::Failed {
+            agent_id: result.agent_id.clone(),
+            error: summarize_subagent_result(result),
+        },
+        SubAgentStatus::Running => MailboxMessage::Progress {
+            agent_id: result.agent_id.clone(),
+            status: "running".to_string(),
+        },
+    }
+}
+
 /// Parent transcript snapshot available to sub-agents that opt into context
 /// forking. Leading messages may be inherited as context, but every child
 /// keeps its own resolved system prompt so parent-specific model identity or
@@ -2145,6 +2227,10 @@ pub struct SubAgent {
     /// queued (#1961). Competing cancellation/interrupt paths must treat the
     /// claim as terminal ownership and leave the task to finalize.
     completion_claimed: bool,
+    /// Process-local terminal fan-in sinks. Never serialized; restored agents
+    /// have no live parent/mailbox/event consumers and are reconciled directly
+    /// to interrupted state during load.
+    terminal_delivery: Option<SubAgentTerminalDeliveryContext>,
     input_tx: Option<mpsc::UnboundedSender<SubAgentInput>>,
     task_handle: Option<JoinHandle<()>>,
 }
@@ -2188,6 +2274,7 @@ impl SubAgent {
             session_boot_id,
             workspace,
             completion_claimed: false,
+            terminal_delivery: None,
             input_tx: Some(input_tx),
             task_handle: None,
         }
@@ -2623,6 +2710,7 @@ impl SubAgentManager {
                 // i.e. agent classified as prior-session.
                 session_boot_id: persisted.session_boot_id,
                 completion_claimed: false,
+                terminal_delivery: None,
                 input_tx: None,
                 task_handle: None,
             };
@@ -2641,10 +2729,44 @@ impl SubAgentManager {
             self.worker_records
                 .insert(worker.spec.worker_id.clone(), worker);
         }
+        self.reconcile_orphaned_workers_after_restart();
         self.refresh_all_budget_scopes();
         self.prune_worker_records();
 
         Ok(())
+    }
+
+    /// No in-process task survives a manager restart. Reconcile every worker
+    /// status that requires a live executor to `Interrupted`, matching the
+    /// existing top-level agent restoration above. Terminal receipts and
+    /// waiting-for-user records remain unchanged, and the status guard makes
+    /// repeated reconciliation idempotent (#4408).
+    fn reconcile_orphaned_workers_after_restart(&mut self) -> usize {
+        let orphaned = self
+            .worker_records
+            .values()
+            .filter(|record| {
+                matches!(
+                    record.status,
+                    AgentWorkerStatus::Queued
+                        | AgentWorkerStatus::Starting
+                        | AgentWorkerStatus::Running
+                        | AgentWorkerStatus::ModelWait
+                        | AgentWorkerStatus::RunningTool
+                )
+            })
+            .map(|record| (record.spec.worker_id.clone(), record.steps_taken))
+            .collect::<Vec<_>>();
+        for (worker_id, steps_taken) in &orphaned {
+            self.record_worker_event(
+                worker_id,
+                AgentWorkerStatus::Interrupted,
+                Some(SUBAGENT_RESTART_REASON.to_string()),
+                Some(*steps_taken),
+                None,
+            );
+        }
+        orphaned.len()
     }
 
     fn sorted_worker_records(&self) -> Vec<AgentWorkerRecord> {
@@ -2940,47 +3062,25 @@ impl SubAgentManager {
         }
     }
 
-    fn fail_worker(&mut self, worker_id: &str, error: String) {
-        self.record_worker_event(
-            worker_id,
-            AgentWorkerStatus::Failed,
-            Some(error.clone()),
-            None,
-            None,
-        );
-        if let Some(record) = self.worker_records.get_mut(worker_id) {
-            record.error = Some(error);
-        }
-    }
-
     pub fn cancel_agent(&mut self, agent_ref: &str) -> Result<SubAgentResult> {
         let agent_id = self.resolve_agent_ref(agent_ref)?;
-        let snapshot = {
+        let mut terminal = {
             let agent = self
                 .agents
-                .get_mut(&agent_id)
+                .get(&agent_id)
                 .ok_or_else(|| anyhow!("Agent {agent_id} not found"))?;
             if agent.status != SubAgentStatus::Running || agent.completion_claimed {
                 return Ok(agent.snapshot());
             }
-            agent.status = SubAgentStatus::Cancelled;
-            agent.result = Some("Cancelled by parent request.".to_string());
-            release_resident_leases_for(&agent.id);
-            if let Some(handle) = agent.task_handle.take() {
-                handle.abort();
-            }
-            agent.input_tx = None;
             agent.snapshot()
         };
-        self.record_worker_event(
-            &agent_id,
-            AgentWorkerStatus::Cancelled,
-            snapshot.result.clone(),
-            Some(snapshot.steps_taken),
-            None,
-        );
-        self.persist_state_best_effort();
-        Ok(snapshot)
+        terminal.status = SubAgentStatus::Cancelled;
+        terminal.result = Some("Cancelled by parent request.".to_string());
+        terminal.needs_input = None;
+        if !self.finish_terminal_result(&agent_id, terminal, true, true) {
+            return self.get_result(&agent_id);
+        }
+        self.get_result(&agent_id)
     }
 
     /// Queue parent mail without waking the child (`agents/message`).
@@ -3150,20 +3250,16 @@ impl SubAgentManager {
             })
         };
 
-        // Abort the live task after snapshotting prior state.
-        {
-            let agent = self
-                .agents
-                .get_mut(&agent_id)
-                .ok_or_else(|| anyhow!("Agent {agent_id} not found"))?;
-            if let Some(handle) = agent.task_handle.take() {
-                handle.abort();
-            }
-            agent.input_tx = None;
+        let mut terminal = prior.clone();
+        terminal.status = SubAgentStatus::Interrupted(reason.clone());
+        terminal.result = Some(reason);
+        terminal.steps_taken = checkpoint.steps_taken;
+        terminal.checkpoint = Some(checkpoint);
+        terminal.needs_input = None;
+        if !self.finish_terminal_result(&agent_id, terminal, true, true) {
+            return Ok((prior, self.get_result(&agent_id)?));
         }
-        release_resident_leases_for(&agent_id);
-
-        let snapshot = self.interrupt_with_checkpoint(&agent_id, reason, checkpoint, None)?;
+        let snapshot = self.get_result(&agent_id)?;
         Ok((prior, snapshot))
     }
 
@@ -3569,6 +3665,7 @@ impl SubAgentManager {
             spawn_depth: runtime.spawn_depth,
             max_spawn_depth: runtime.max_spawn_depth,
         };
+        agent.terminal_delivery = Some(SubAgentTerminalDeliveryContext::from_runtime(&runtime));
         self.register_worker(worker_spec);
         if let Some(scope) = budget_scope {
             self.attach_budget_scope(&agent_id, scope);
@@ -3750,45 +3847,42 @@ impl SubAgentManager {
         transcript_candidates.dedup();
         let mut auto_cancelled = 0;
         let timeout = self.running_heartbeat_timeout;
-        let mut worker_cancellations = Vec::new();
-        for agent in self.agents.values_mut() {
-            if agent.status == SubAgentStatus::Running
-                && !agent.completion_claimed
-                && agent.task_handle.is_some()
-                && agent.last_activity_at.elapsed() >= timeout
-            {
+        let stale_agent_ids = self
+            .agents
+            .values()
+            .filter(|agent| {
+                agent.status == SubAgentStatus::Running
+                    && !agent.completion_claimed
+                    && agent.task_handle.is_some()
+                    && agent.last_activity_at.elapsed() >= timeout
+            })
+            .map(|agent| agent.id.clone())
+            .collect::<Vec<_>>();
+        for agent_id in stale_agent_ids {
+            if let Some(agent) = self.agents.get(&agent_id) {
                 tracing::warn!(
                     target: "subagent",
                     agent_id = %agent.id,
                     timeout_secs = timeout.as_secs(),
                     "auto-cancelling stale sub-agent with no manager-visible progress"
                 );
-                agent.status = SubAgentStatus::Cancelled;
-                agent.result = Some(format!(
-                    "Auto-cancelled after {}s without sub-agent progress.",
-                    timeout.as_secs()
-                ));
-                release_resident_leases_for(&agent.id);
-                if let Some(handle) = agent.task_handle.take() {
-                    handle.abort();
-                }
-                agent.input_tx = None;
-                worker_cancellations.push((
-                    agent.id.clone(),
-                    agent.result.clone(),
-                    agent.steps_taken,
-                ));
+            }
+            let Some(mut terminal) = self.agents.get(&agent_id).map(SubAgent::snapshot) else {
+                continue;
+            };
+            terminal.status = SubAgentStatus::Cancelled;
+            terminal.result = Some(format!(
+                "Auto-cancelled after {}s without sub-agent progress.",
+                timeout.as_secs()
+            ));
+            terminal.needs_input = None;
+            // Cleanup batches stale transitions and persists the final fleet
+            // snapshot once below. Spawning one unordered background write
+            // per child could let an earlier partial snapshot rename last and
+            // resurrect a cancelled worker after restart.
+            if self.finish_terminal_result(&agent_id, terminal, true, false) {
                 auto_cancelled += 1;
             }
-        }
-        for (agent_id, message, steps_taken) in worker_cancellations {
-            self.record_worker_event(
-                &agent_id,
-                AgentWorkerStatus::Cancelled,
-                message,
-                Some(steps_taken),
-                None,
-            );
         }
         self.agents.retain(|_, agent| {
             if agent.status == SubAgentStatus::Running {
@@ -3851,8 +3945,9 @@ impl SubAgentManager {
     ///
     /// The claim excludes cancellation while deliberately leaving the public
     /// status `Running`. `run_subagent_task` can therefore queue completion to
-    /// the parent before the running-child gate closes (#1961), without
-    /// holding this manager lock across any external send.
+    /// the parent before the running-child gate closes (#1961). The winning
+    /// finisher performs only non-awaiting channel sends while it owns the
+    /// manager guard, then commits the terminal projections.
     fn claim_terminal_delivery(&mut self, agent_id: &str) -> bool {
         let Some(agent) = self.agents.get_mut(agent_id) else {
             return false;
@@ -3864,12 +3959,63 @@ impl SubAgentManager {
         true
     }
 
+    /// Own, publish, and commit one terminal outcome.
+    ///
+    /// Claiming first makes natural completion, explicit Stop, coordination
+    /// interrupt, and stale cleanup race on one bit. The winning path attempts
+    /// every live fan-in send while both public projections still read
+    /// Running, then commits the matching agent and worker terminal states.
+    /// Late task output and repeated Stop calls cannot publish a second result.
+    fn finish_terminal_result(
+        &mut self,
+        agent_id: &str,
+        result: SubAgentResult,
+        abort_task: bool,
+        persist_after_commit: bool,
+    ) -> bool {
+        if result.status == SubAgentStatus::Running || result.agent_id != agent_id {
+            return false;
+        }
+        if !self.claim_terminal_delivery(agent_id) {
+            return false;
+        }
+
+        if abort_task
+            && let Some(handle) = self
+                .agents
+                .get_mut(agent_id)
+                .and_then(|agent| agent.task_handle.take())
+        {
+            handle.abort();
+        }
+
+        let delivery = self
+            .agents
+            .get(agent_id)
+            .and_then(|agent| agent.terminal_delivery.clone());
+        if let Some(delivery) = delivery {
+            delivery.deliver(&result);
+        }
+
+        self.update_from_result_with_persist(agent_id, result, persist_after_commit)
+    }
+
     /// Commit a claimed natural task result.
     ///
     /// Returns `true` only when the prior claim still owns the terminal
     /// transition. External notification is deliberately queued between
     /// [`Self::claim_terminal_delivery`] and this commit.
+    #[cfg(test)]
     fn update_from_result(&mut self, agent_id: &str, result: SubAgentResult) -> bool {
+        self.update_from_result_with_persist(agent_id, result, true)
+    }
+
+    fn update_from_result_with_persist(
+        &mut self,
+        agent_id: &str,
+        result: SubAgentResult,
+        persist_after_commit: bool,
+    ) -> bool {
         let Some(agent) = self.agents.get_mut(agent_id) else {
             return false;
         };
@@ -3887,27 +4033,12 @@ impl SubAgentManager {
         }
         agent.completion_claimed = false;
         agent.task_handle = None;
-        self.complete_worker_from_result(agent_id, &result);
-        self.persist_state_best_effort();
-        true
-    }
-
-    /// Commit a claimed task failure.
-    /// See [`Self::update_from_result`] for the external-delivery contract.
-    fn update_failed(&mut self, agent_id: &str, error: String) -> bool {
-        let Some(agent) = self.agents.get_mut(agent_id) else {
-            return false;
-        };
-        if agent.status != SubAgentStatus::Running || !agent.completion_claimed {
-            return false;
-        }
-        agent.status = SubAgentStatus::Failed(error.clone());
-        agent.completion_claimed = false;
+        agent.terminal_delivery = None;
         release_resident_leases_for(agent_id);
-        agent.input_tx = None;
-        agent.task_handle = None;
-        self.fail_worker(agent_id, error);
-        self.persist_state_best_effort();
+        self.complete_worker_from_result(agent_id, &result);
+        if persist_after_commit {
+            self.persist_state_best_effort();
+        }
         true
     }
 
@@ -3923,38 +4054,6 @@ impl SubAgentManager {
         // full transcripts) to disk under the write lock on every step.
         self.persist_state_debounced();
         true
-    }
-
-    fn interrupt_with_checkpoint(
-        &mut self,
-        agent_id: &str,
-        reason: String,
-        checkpoint: SubAgentCheckpoint,
-        needs_input: Option<SubAgentNeedsInput>,
-    ) -> Result<SubAgentResult> {
-        let snapshot = {
-            let agent = self
-                .agents
-                .get_mut(agent_id)
-                .ok_or_else(|| anyhow!("Agent {agent_id} not found"))?;
-            agent.status = SubAgentStatus::Interrupted(reason.clone());
-            agent.result = Some(reason);
-            agent.steps_taken = checkpoint.steps_taken;
-            agent.checkpoint = Some(checkpoint);
-            agent.needs_input = needs_input;
-            agent.last_activity_at = Instant::now();
-            release_resident_leases_for(agent_id);
-            agent.snapshot()
-        };
-        self.record_worker_event(
-            agent_id,
-            AgentWorkerStatus::Interrupted,
-            snapshot.result.clone(),
-            Some(snapshot.steps_taken),
-            None,
-        );
-        self.persist_state_best_effort();
-        Ok(snapshot)
     }
 }
 
@@ -5777,6 +5876,21 @@ struct SubAgentTask {
 
 #[allow(clippy::too_many_lines)]
 async fn run_subagent_task(task: SubAgentTask) {
+    // `spawn_background_with_assignment_options` installs this before the task
+    // is scheduled. Keep this fallback for internal/test task launchers so a
+    // manually-created worker still owns the same terminal fan-in contract.
+    {
+        let delivery = SubAgentTerminalDeliveryContext::from_runtime(&task.runtime);
+        let mut manager = task.manager_handle.write().await;
+        if let Some(agent) = manager.agents.get_mut(&task.agent_id)
+            && agent.status == SubAgentStatus::Running
+            && !agent.completion_claimed
+            && agent.terminal_delivery.is_none()
+        {
+            agent.terminal_delivery = Some(delivery);
+        }
+    }
+
     let deadline = task.started_at + task.wall_time;
 
     // Interactive launch gate (#3095): direct children acquire a permit
@@ -5834,168 +5948,60 @@ async fn run_subagent_task(task: SubAgentTask) {
         .unwrap_or_else(|_| Err(anyhow!(child_wall_time_exhausted_reason(task.wall_time))))
     };
 
-    // Emit BOTH a human-friendly summary (rendered in the parent's
-    // sidebar / cell) AND a structured sentinel the model can recognize
-    // on its next turn. Format: human summary on the first line,
-    // sentinel on the second. The sentinel uses an opaque tag
-    // (`codewhale:subagent.done`) to avoid collision with normal user
-    // text.
-    let model_id = task.runtime.model.clone();
-    let (summary, sentinel, failure_error) = match &result {
-        Ok(res) => {
-            // Issue #2652: the child's free-text result is its self-report, not
-            // verified evidence. Stamp it with a provenance marker: a soft
-            // "re-verify" note when short, or a head+tail truncation (reusing
-            // the tool-output vocabulary) when it exceeds the wire budget. The
-            // resulting `truncated` flag is carried in the sentinel so the
-            // parent model can branch on `summary_kind`.
-            let raw = summarize_subagent_result(res);
-            let (summary, truncated) = stamp_subagent_summary(&raw);
-            let sentinel = match &res.status {
-                SubAgentStatus::Failed(_) | SubAgentStatus::BudgetExhausted => {
-                    subagent_failed_sentinel(&task.agent_id, &raw)
-                }
-                _ => subagent_done_sentinel(&task.agent_id, res, truncated),
-            };
-            (summary, sentinel, None)
-        }
-        Err(err) => {
-            crate::logging::warn(format!(
-                "sub-agent {} model request failed: {err:#}",
-                task.agent_id
-            ));
-            let annotated = annotate_child_model_error(
-                &subagent_failure_message(err),
-                &model_id,
-                task.runtime.client.api_provider(),
-                &task.runtime.worker_profile.model,
-            );
-            let sentinel = subagent_failed_sentinel(&task.agent_id, &annotated);
-            (format!("Failed: {annotated}"), sentinel, Some(annotated))
-        }
-    };
-
-    let payload = format!("{summary}\n{sentinel}");
     let agent_id = task.agent_id.clone();
+    let failure_error = result.as_ref().err().map(|err| {
+        crate::logging::warn(format!(
+            "sub-agent {} model request failed: {err:#}",
+            task.agent_id
+        ));
+        annotate_child_model_error(
+            &subagent_failure_message(err),
+            &task.runtime.model,
+            task.runtime.client.api_provider(),
+            &task.runtime.worker_profile.model,
+        )
+    });
 
-    // Claim terminal ownership under the manager lock, then release it before
-    // touching external sinks. The public status stays Running while claimed:
-    // this preserves #1961's running-child gate until parent completion is
-    // queued, while cancel/interrupt/cleanup paths cannot steal the terminal
-    // outcome between notification sends.
-    let completion_claimed = {
+    // Every terminal path — successful/fatal model exit, explicit Stop,
+    // coordination interrupt, and stale cleanup — arbitrates and publishes
+    // through `finish_terminal_result`. Cancellation that already won leaves
+    // this late epilogue with no claim and therefore no duplicate fan-in.
+    let terminal_committed = {
         let mut manager = task.manager_handle.write().await;
-        manager.claim_terminal_delivery(&agent_id)
-    };
-    if !completion_claimed {
-        // A retryable provider interruption is committed inside
-        // `run_subagent` so its checkpoint is durable before this epilogue.
-        // That makes the ordinary Running -> claimed transition unavailable,
-        // but a Workflow/nested parent still needs a terminal completion or
-        // its `task()` waiter will hang forever. Wake only when the manager
-        // still owns the same precommitted Interrupted state. If cancellation
-        // won after the interruption, the public state is Cancelled and the
-        // late completion remains suppressed.
-        let precommitted_interruption_delivered = match &result {
-            Ok(res) => {
-                emit_precommitted_interruption_completion(
-                    &task.runtime,
-                    &task.manager_handle,
-                    &agent_id,
-                    &res.status,
-                    &payload,
-                )
-                .await
+        let terminal = match result {
+            Ok(result) => result,
+            Err(_) => {
+                let mut result = match manager.get_result(&agent_id) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        tracing::error!(
+                            target: "subagent",
+                            agent_id = %agent_id,
+                            ?err,
+                            "failed task no longer has a manager record"
+                        );
+                        return;
+                    }
+                };
+                result.status = SubAgentStatus::Failed(
+                    failure_error
+                        .clone()
+                        .expect("failed task should carry annotated error"),
+                );
+                result.result = None;
+                result.needs_input = None;
+                result
             }
-            Err(_) => false,
         };
+        manager.finish_terminal_result(&agent_id, terminal, false, true)
+    };
+    if !terminal_committed {
         tracing::debug!(
             target: "subagent",
             agent_id = %agent_id,
-            precommitted_interruption_delivered,
             "suppressing late task completion after another terminal outcome won"
         );
-        return;
     }
-
-    if let Some(mb) = task.runtime.mailbox.as_ref() {
-        let envelope = match &result {
-            Ok(res) => match &res.status {
-                SubAgentStatus::Failed(_) | SubAgentStatus::BudgetExhausted => {
-                    MailboxMessage::Failed {
-                        agent_id: task.agent_id.clone(),
-                        error: summary.clone(),
-                    }
-                }
-                _ => MailboxMessage::Completed {
-                    agent_id: task.agent_id.clone(),
-                    summary: summary.clone(),
-                },
-            },
-            Err(_) => MailboxMessage::Failed {
-                agent_id: task.agent_id.clone(),
-                error: failure_error
-                    .as_ref()
-                    .expect("failed task should carry annotated error")
-                    .clone(),
-            },
-        };
-        let _ = mb.send(envelope);
-    }
-
-    // Wake the engine's parent turn loop if this is one of its direct
-    // children (issue #756). The manager lock is deliberately not held while
-    // sending to any external consumer.
-    emit_parent_completion(&task.runtime, &agent_id, &payload);
-
-    if let Some(event_tx) = task.runtime.event_tx.as_ref() {
-        let _ = event_tx.try_send(Event::AgentComplete {
-            id: agent_id.clone(),
-            result: payload,
-        });
-    }
-
-    // All external sends above are nonblocking and occur without the manager
-    // lock. Only after they are queued do we close the public Running state.
-    let terminal_committed = {
-        let mut manager = task.manager_handle.write().await;
-        match &result {
-            Ok(res) => manager.update_from_result(&agent_id, res.clone()),
-            Err(_) => manager.update_failed(
-                &agent_id,
-                failure_error
-                    .as_ref()
-                    .expect("failed task should carry annotated error")
-                    .clone(),
-            ),
-        }
-    };
-    if !terminal_committed {
-        tracing::error!(
-            target: "subagent",
-            agent_id = %agent_id,
-            "claimed task completion could not commit terminal state"
-        );
-    }
-}
-
-async fn emit_precommitted_interruption_completion(
-    runtime: &SubAgentRuntime,
-    manager: &SharedSubAgentManager,
-    agent_id: &str,
-    result_status: &SubAgentStatus,
-    payload: &str,
-) -> bool {
-    if !matches!(result_status, SubAgentStatus::Interrupted(_)) {
-        return false;
-    }
-    let manager_still_interrupted = manager
-        .read()
-        .await
-        .get_result(agent_id)
-        .ok()
-        .is_some_and(|snapshot| matches!(snapshot.status, SubAgentStatus::Interrupted(_)));
-    manager_still_interrupted && emit_parent_completion(runtime, agent_id, payload)
 }
 
 async fn acquire_queued_launch_permit(
@@ -6053,6 +6059,7 @@ async fn record_queued_launch_progress(task: &SubAgentTask) {
 /// attempted, `false` if this is the engine itself or no channel is wired.
 /// Skips silently when the channel sender has no receiver — the receiver may
 /// have ended because the parent turn/agent already completed.
+#[cfg(test)]
 pub(crate) fn emit_parent_completion(
     runtime: &SubAgentRuntime,
     agent_id: &str,
@@ -6831,11 +6838,6 @@ async fn run_subagent(
                 &agent_id,
                 format!("{}: cancelled", format_step_counter(steps, max_steps)),
             );
-            if let Some(mb) = runtime.mailbox.as_ref() {
-                let _ = mb.send(MailboxMessage::Cancelled {
-                    agent_id: agent_id.clone(),
-                });
-            }
             let status = SubAgentStatus::Cancelled;
             let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
             insert_subagent_full_transcript_handle(
@@ -6977,11 +6979,6 @@ async fn run_subagent(
                     &agent_id,
                     format!("{}: cancelled mid-request", format_step_counter(steps, max_steps)),
                 );
-                if let Some(mb) = runtime.mailbox.as_ref() {
-                    let _ = mb.send(MailboxMessage::Cancelled {
-                        agent_id: agent_id.clone(),
-                    });
-                }
                 let status = SubAgentStatus::Cancelled;
                 let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
                 insert_subagent_full_transcript_handle(
@@ -7067,15 +7064,6 @@ async fn run_subagent(
                         .await;
                         let needs_input =
                             needs_input_for_interrupted_checkpoint(&reason, &checkpoint);
-                        let interrupted_snapshot = {
-                            let mut manager = runtime.manager.write().await;
-                            manager.interrupt_with_checkpoint(
-                                &agent_id,
-                                reason.clone(),
-                                checkpoint.clone(),
-                                Some(needs_input.clone()),
-                            )?
-                        };
                         record_agent_progress(
                             runtime,
                             &agent_id,
@@ -7085,13 +7073,33 @@ async fn run_subagent(
                                 needs_input.question
                             ),
                         );
-                        if let Some(mb) = runtime.mailbox.as_ref() {
-                            let _ = mb.send(MailboxMessage::Interrupted {
-                                agent_id: agent_id.clone(),
-                                reason: reason.clone(),
-                            });
-                        }
-                        return Ok(interrupted_snapshot);
+                        return Ok(SubAgentResult {
+                            name: agent_id.clone(),
+                            agent_id: agent_id.clone(),
+                            context_mode: if fork_context_enabled {
+                                "forked"
+                            } else {
+                                "fresh"
+                            }
+                            .to_string(),
+                            fork_context: fork_context_enabled,
+                            workspace: Some(runtime.context.workspace.clone()),
+                            git_branch: current_git_branch(&runtime.context.workspace),
+                            agent_type: agent_type.clone(),
+                            assignment: assignment.clone(),
+                            model: runtime.model.clone(),
+                            nickname: None,
+                            status,
+                            worker_status: None,
+                            parent_run_id: runtime.parent_agent_id.clone(),
+                            spawn_depth: runtime.spawn_depth,
+                            result: Some(reason),
+                            steps_taken: steps,
+                            checkpoint: Some(checkpoint),
+                            needs_input: Some(needs_input),
+                            duration_ms,
+                            from_prior_session: false,
+                        });
                     }
                 }
             }
@@ -7132,11 +7140,6 @@ async fn run_subagent(
                     format_step_counter(steps, max_steps)
                 ),
             );
-            if let Some(mb) = runtime.mailbox.as_ref() {
-                let _ = mb.send(MailboxMessage::Cancelled {
-                    agent_id: agent_id.clone(),
-                });
-            }
             let status = SubAgentStatus::BudgetExhausted;
             let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
             latest_checkpoint = Some(
