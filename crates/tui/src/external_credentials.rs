@@ -355,7 +355,7 @@ fn normalize_windows_path_for_comparison(path: &Path) -> io::Result<String> {
 
 /// Apply a protected DACL granting only the current Windows user full access.
 /// Directories propagate that owner-only policy to newly staged generations.
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 pub(crate) fn secure_codewhale_owned_windows_path(
     path: &Path,
     inherit_to_children: bool,
@@ -870,6 +870,7 @@ mod tests {
     fn windows_handle_path_comparison_is_lossless_and_fails_closed() {
         use std::ffi::OsString;
         use std::os::windows::ffi::OsStringExt as _;
+        use std::path::PathBuf;
 
         let expected = PathBuf::from(r"C:\Users\Alice\credential.json");
         let kernel = PathBuf::from(r"\\?\C:\Users\Alice\credential.json");
