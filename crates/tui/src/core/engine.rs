@@ -2821,7 +2821,10 @@ impl Engine {
             reasoning_effort_auto,
             provenance,
         );
+        let base_content_blocks = user_msg.content.len();
         let user_msg = self.with_slop_ledger_gate_for_initial_user_turn(user_msg, provenance);
+        turn.active_slop_gate_message =
+            (user_msg.content.len() > base_content_blocks).then(|| user_msg.clone());
         self.session.add_message(user_msg);
 
         let previous_goal_objective = self.config.goal_objective.clone();
@@ -3412,10 +3415,39 @@ impl Engine {
         removed
     }
 
+    /// Merge working-set pins with the mutable completion gate carried by the
+    /// current top-level user turn. The exact message identity matters: an
+    /// unchanged ledger can produce identical gate text on older turns, and
+    /// pinning every historical copy would defeat compaction.
+    fn compaction_pins_for_active_turn(
+        &self,
+        active_slop_gate_message: Option<&Message>,
+    ) -> Vec<usize> {
+        let mut pins = self
+            .session
+            .working_set
+            .pinned_message_indices(&self.session.messages, &self.session.workspace);
+
+        if let Some(active_message) = active_slop_gate_message
+            && let Some(index) = self
+                .session
+                .messages
+                .iter()
+                .rposition(|message| message == active_message)
+        {
+            pins.push(index);
+        }
+
+        pins.sort_unstable();
+        pins.dedup();
+        pins
+    }
+
     async fn recover_context_overflow(
         &mut self,
         client: &dyn crate::core::model_client::ModelClient,
         reason: &str,
+        active_slop_gate_message: Option<&Message>,
     ) -> bool {
         let Some(target_budget) = context_input_budget_for_route(
             self.api_provider,
@@ -3449,10 +3481,7 @@ impl Engine {
         // Previously this passed None/None, so a compaction routed here (which,
         // on large windows, is the path that actually fires) could summarize
         // away pinned errors, patches, and the files the user is editing.
-        let compaction_pins = self
-            .session
-            .working_set
-            .pinned_message_indices(&self.session.messages, &self.session.workspace);
+        let compaction_pins = self.compaction_pins_for_active_turn(active_slop_gate_message);
         let compaction_paths = self.session.working_set.top_paths(24);
 
         match compact_messages_safe(
