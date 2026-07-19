@@ -580,6 +580,12 @@ async fn release_six_worker_fanout_keeps_typing_render_and_esc_cancel_live() -> 
         "Esc cancellation exceeded the five-second liveness budget"
     );
 
+    // Let the raw-key paste-burst window from the pre-cancel marker expire.
+    // Without this guard, the first character of the next marker can remain
+    // retained while cancellation repaints, making this a paste-heuristic
+    // race instead of the intended post-cancel composer-liveness assertion.
+    std::thread::sleep(PASTE_GUARD_SETTLE);
+    tui.pump();
     tui.send(keys::key::text("post-cancel-live"))?;
     tui.wait_for_text("post-cancel-live", Duration::from_secs(3))?;
     assert_eq!(child_requests.load(Ordering::SeqCst), 6);

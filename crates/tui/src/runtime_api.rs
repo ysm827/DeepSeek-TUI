@@ -2167,12 +2167,12 @@ async fn cancel_task(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<TaskRecord>, ApiError> {
-    let task = state
+    let cancellation = state
         .task_manager
         .cancel_task(&id)
         .await
         .map_err(map_task_err)?;
-    Ok(Json(task))
+    Ok(Json(cancellation.task))
 }
 
 async fn stream_thread_events(
