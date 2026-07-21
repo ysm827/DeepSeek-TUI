@@ -707,6 +707,11 @@ impl ToolRegistryBuilder {
 
     /// Include durable task, gate, PR-attempt, GitHub, and automation tools.
     ///
+    /// Each family is one model-visible tool with an `action` parameter
+    /// (`tasks`, `github`, `automation`); the legacy per-action names stay
+    /// registered as hidden compat aliases so saved transcripts replay
+    /// (#4625 pattern, piagent phase B).
+    ///
     /// Shell-related task tools (`task_shell_start`, `task_shell_wait`) are
     /// *not* included here — use [`with_runtime_task_shell_tools`] to register
     /// them when `allow_shell` is true.
@@ -782,6 +787,10 @@ impl ToolRegistryBuilder {
     /// Include only read-only durable task, PR-attempt, GitHub, and automation
     /// inspection tools. Plan mode uses this surface so it can observe state
     /// without starting work, changing remotes, or mutating automation config.
+    ///
+    /// The model sees the same canonical `tasks` / `github` / `automation`
+    /// tools as the full surface, restricted to their read-only actions;
+    /// the legacy read-only names stay registered as hidden aliases.
     #[must_use]
     pub fn with_runtime_read_only_task_tools(self) -> Self {
         use super::automation::AutomationTool;
@@ -2038,6 +2047,181 @@ mod tests {
 
         // All legacy aliases are hidden.
         for alias in ["exec_shell", "exec_wait", "exec_interact", "exec_shell_wait", "exec_shell_interact", "exec_shell_cancel"] {
+            assert!(
+                api_names.iter().all(|n| n != alias),
+                "{alias} should be hidden from the model catalog"
+            );
+        }
+    }
+
+    /// Piagent phase B — each durable-work family exposes one canonical
+    /// action-parameterized tool (`tasks`, `github`, `automation`); the
+    /// legacy per-action names remain callable as hidden compat aliases.
+    #[test]
+    fn runtime_task_families_expose_canonical_tools_with_hidden_aliases() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let registry = ToolRegistryBuilder::new()
+            .with_runtime_task_tools()
+            .build(ctx);
+
+        let legacy_aliases = [
+            "task_create",
+            "task_list",
+            "task_read",
+            "task_cancel",
+            "task_gate_run",
+            "pr_attempt_record",
+            "pr_attempt_list",
+            "pr_attempt_read",
+            "pr_attempt_preflight",
+            "github_issue_context",
+            "github_pr_context",
+            "github_comment",
+            "github_close_issue",
+            "github_close_pr",
+            "automation_create",
+            "automation_list",
+            "automation_read",
+            "automation_update",
+            "automation_pause",
+            "automation_resume",
+            "automation_delete",
+            "automation_run",
+        ];
+        // Legacy aliases stay callable.
+        for alias in legacy_aliases {
+            assert!(registry.contains(alias), "{alias} should remain callable");
+        }
+
+        let api_names: Vec<String> = registry
+            .to_api_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+
+        // Only the canonical tools are model-visible.
+        for canonical in ["tasks", "github", "automation"] {
+            assert!(
+                api_names.iter().any(|n| n == canonical),
+                "{canonical} should be model-visible"
+            );
+        }
+        // All legacy aliases are hidden.
+        for alias in legacy_aliases {
+            assert!(
+                api_names.iter().all(|n| n != alias),
+                "{alias} should be hidden from the model catalog"
+            );
+        }
+    }
+
+    /// The Plan-mode read-only surface registers the same canonical tools
+    /// restricted to their read actions, plus hidden aliases for the legacy
+    /// read-only names only — write names stay unregistered, exactly as
+    /// before the unification.
+    #[test]
+    fn read_only_task_surface_keeps_write_aliases_unregistered() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let registry = ToolRegistryBuilder::new()
+            .with_runtime_read_only_task_tools()
+            .build(ctx);
+
+        for name in [
+            "task_list",
+            "task_read",
+            "pr_attempt_list",
+            "pr_attempt_read",
+            "github_issue_context",
+            "github_pr_context",
+            "automation_list",
+            "automation_read",
+        ] {
+            assert!(registry.contains(name), "{name} should remain callable");
+        }
+        for name in [
+            "task_create",
+            "task_cancel",
+            "task_gate_run",
+            "pr_attempt_record",
+            "pr_attempt_preflight",
+            "github_comment",
+            "github_close_issue",
+            "github_close_pr",
+            "automation_create",
+            "automation_update",
+            "automation_pause",
+            "automation_resume",
+            "automation_delete",
+            "automation_run",
+        ] {
+            assert!(
+                !registry.contains(name),
+                "{name} must stay unregistered on the read-only surface"
+            );
+        }
+
+        let api_names: Vec<String> = registry
+            .to_api_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert_eq!(api_names.len(), 3);
+        for canonical in ["tasks", "github", "automation"] {
+            assert!(
+                api_names.iter().any(|n| n == canonical),
+                "{canonical} should be model-visible on the read-only surface"
+            );
+        }
+        // Every registered tool stays read-only (Plan-mode invariant).
+        for tool in registry.all() {
+            let caps = tool.capabilities();
+            assert!(
+                !caps.contains(&ToolCapability::WritesFiles)
+                    && !caps.contains(&ToolCapability::ExecutesCode),
+                "read-only surface must not register write/exec tools: {}",
+                tool.name()
+            );
+        }
+    }
+
+    /// The unified `rlm` tool is the only model-visible RLM surface; the
+    /// legacy `rlm_*` names remain callable as hidden aliases.
+    #[test]
+    fn rlm_family_exposes_canonical_tool_with_hidden_aliases() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let registry = ToolRegistryBuilder::new()
+            .with_rlm_tool(None, "deepseek-v4-pro".to_string())
+            .build(ctx);
+
+        for alias in [
+            "rlm_session_objects",
+            "rlm_open",
+            "rlm_eval",
+            "rlm_configure",
+            "rlm_close",
+        ] {
+            assert!(registry.contains(alias), "{alias} should remain callable");
+        }
+
+        let api_names: Vec<String> = registry
+            .to_api_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(
+            api_names.iter().any(|n| n == "rlm"),
+            "rlm should be model-visible"
+        );
+        for alias in [
+            "rlm_session_objects",
+            "rlm_open",
+            "rlm_eval",
+            "rlm_configure",
+            "rlm_close",
+        ] {
             assert!(
                 api_names.iter().all(|n| n != alias),
                 "{alias} should be hidden from the model catalog"
