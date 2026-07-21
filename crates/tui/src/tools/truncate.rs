@@ -293,13 +293,11 @@ pub fn apply_spillover(result: &mut ToolResult, tool_id: &str) -> Option<PathBuf
     apply_spillover_inner(result, tool_id, None)
 }
 
-/// Apply spillover and emit a session-scoped artifact reference.
+/// Apply adaptive routing and publish session-scoped exact evidence.
 ///
-/// The home-level `tool_outputs/<tool-id>.txt` file is still written
-/// so `retrieve_tool_result ref=<tool-id>` keeps working during the
-/// transition. The canonical artifact content is also written under
-/// `~/.codewhale/sessions/<session-id>/artifacts/`, and the inline tool result
-/// becomes a fixed-format artifact reference block.
+/// The default path writes one immutable payload under the origin session and
+/// replaces non-inline content with a calm, bounded receipt. The legacy dual
+/// spillover behavior is reachable only through the classic rollback switch.
 pub fn apply_spillover_with_artifact(
     result: &mut ToolResult,
     tool_id: &str,
@@ -326,6 +324,11 @@ fn apply_spillover_inner(
     tool_id: &str,
     artifact_context: Option<ArtifactSpilloverContext<'_>>,
 ) -> Option<PathBuf> {
+    if artifact_context.is_some()
+        && !crate::tools::large_output_router::classic_output_routing_enabled()
+    {
+        return apply_adaptive_evidence_inner(result, tool_id, artifact_context.unwrap());
+    }
     if !result.success {
         return None;
     }
@@ -526,6 +529,163 @@ fn apply_spillover_inner(
     artifact_path
         .map(|(absolute_path, _, _)| absolute_path)
         .or(Some(path))
+}
+
+fn apply_adaptive_evidence_inner(
+    result: &mut ToolResult,
+    tool_id: &str,
+    context: ArtifactSpilloverContext<'_>,
+) -> Option<PathBuf> {
+    use crate::tools::large_output_router::{
+        DEFAULT_LARGE_OUTPUT_THRESHOLD_TOKENS, EVIDENCE_RETENTION_SECS, EvidenceArtifact,
+        EvidenceRetentionState, EvidenceRouting, estimate_tokens, publish_evidence_metadata,
+        unix_millis_now,
+    };
+
+    let estimated_tokens = estimate_tokens(&result.content);
+    let threshold = result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("evidence_threshold_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(DEFAULT_LARGE_OUTPUT_THRESHOLD_TOKENS);
+    let routing = result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("evidence_routing"))
+        .cloned()
+        .and_then(|value| serde_json::from_value::<EvidenceRouting>(value).ok())
+        .unwrap_or_else(|| EvidenceRouting::from_token_estimate(estimated_tokens, threshold));
+    if routing == EvidenceRouting::Inline {
+        return None;
+    }
+
+    let original = result.content.clone();
+    let artifact_id = crate::artifacts::artifact_id_for_tool_call(tool_id);
+    let (absolute_path, relative_path) = match crate::artifacts::write_session_artifact_immutable(
+        context.session_id,
+        &artifact_id,
+        original.as_bytes(),
+    ) {
+        Ok(paths) => paths,
+        Err(err) => {
+            tracing::warn!(target: "evidence", ?err, tool_id, "adaptive evidence content publication failed");
+            return None;
+        }
+    };
+    let digest = crate::hashing::sha256_hex(original.as_bytes());
+    let now_ms = unix_millis_now();
+    let proposed_artifact = EvidenceArtifact {
+        handle: artifact_id.clone(),
+        digest: digest.clone(),
+        size_bytes: original.len().try_into().unwrap_or(u64::MAX),
+        content_type: if serde_json::from_str::<serde_json::Value>(&original).is_ok() {
+            "application/json".to_string()
+        } else {
+            "text/plain".to_string()
+        },
+        tool_name: context.tool_name.to_string(),
+        call_id: tool_id.to_string(),
+        origin_session: context.session_id.to_string(),
+        generation: 1,
+        redacted: false,
+        encoding: "utf-8".to_string(),
+        retention_state: EvidenceRetentionState::Live,
+        created_at_unix_ms: now_ms,
+        retain_until_unix_ms: now_ms.saturating_add(EVIDENCE_RETENTION_SECS * 1_000),
+        storage_path: relative_path.clone(),
+    };
+    let artifact = match crate::tools::large_output_router::read_evidence_metadata(
+        context.session_id,
+        &artifact_id,
+    ) {
+        Ok(existing)
+            if existing.digest == proposed_artifact.digest
+                && existing.size_bytes == proposed_artifact.size_bytes
+                && existing.call_id == proposed_artifact.call_id
+                && existing.origin_session == proposed_artifact.origin_session =>
+        {
+            existing
+        }
+        Ok(_) => {
+            tracing::warn!(target: "evidence", tool_id, "adaptive evidence replay conflicts with immutable metadata");
+            return None;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(err) = publish_evidence_metadata(context.session_id, &proposed_artifact) {
+                tracing::warn!(target: "evidence", ?err, tool_id, "adaptive evidence metadata publication failed");
+                return None;
+            }
+            proposed_artifact
+        }
+        Err(err) => {
+            tracing::warn!(target: "evidence", ?err, tool_id, "adaptive evidence metadata validation failed");
+            return None;
+        }
+    };
+
+    let record = crate::artifacts::record_tool_output_artifact(
+        context.session_id,
+        tool_id,
+        context.tool_name,
+        relative_path.clone(),
+        &original,
+    );
+    let head_limit = if routing == EvidenceRouting::Hybrid {
+        8 * 1024
+    } else {
+        2 * 1024
+    };
+    let tail_limit = if routing == EvidenceRouting::Hybrid {
+        2 * 1024
+    } else {
+        512
+    };
+    let head_end = (0..=head_limit.min(original.len()))
+        .rev()
+        .find(|index| original.is_char_boundary(*index))
+        .unwrap_or(0);
+    let tail = retained_tail(&original, tail_limit);
+    result.content = format!(
+        "[Exact evidence retained · {} · inspect with `retrieve_tool_result ref={}`]\n\n{}\n\n[final excerpt]\n{}",
+        crate::artifacts::format_byte_size(original.len().try_into().unwrap_or(u64::MAX)),
+        artifact_id,
+        &original[..head_end],
+        tail,
+    );
+    let metadata = result.metadata.get_or_insert_with(|| serde_json::json!({}));
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert(
+            "spillover_path".into(),
+            absolute_path.display().to_string().into(),
+        );
+        object.insert("artifact_id".into(), artifact_id.into());
+        object.insert("artifact_session_id".into(), context.session_id.into());
+        object.insert(
+            "artifact_relative_path".into(),
+            relative_path.display().to_string().into(),
+        );
+        object.insert("artifact_byte_size".into(), artifact.size_bytes.into());
+        object.insert("artifact_digest".into(), digest.into());
+        object.insert("artifact_generation".into(), artifact.generation.into());
+        object.insert("artifact_encoding".into(), artifact.encoding.into());
+        object.insert("artifact_retention_state".into(), "live".into());
+        object.insert("evidence_available".into(), true.into());
+        object.insert("truncated".into(), true.into());
+        object.insert("original_byte_count".into(), artifact.size_bytes.into());
+        object.insert("retained_head_bytes".into(), head_end.into());
+        object.insert("retained_tail_bytes".into(), tail.len().into());
+        object.insert(
+            "artifact_preview".into(),
+            original.chars().take(200).collect::<String>().into(),
+        );
+        object.insert(
+            "artifact_record".into(),
+            serde_json::to_value(record).unwrap_or(serde_json::Value::Null),
+        );
+    }
+    Some(absolute_path)
 }
 
 /// Sanitise a tool call id for use as a filename. Keeps ASCII
@@ -888,23 +1048,23 @@ mod tests {
             assert_eq!(path, session_artifact);
             assert_eq!(fs::read_to_string(&session_artifact).unwrap(), big);
             assert!(
-                tmp.path()
+                !tmp.path()
                     .join(".codewhale/tool_outputs/call-big.txt")
                     .exists(),
-                "home-level spillover file should remain during transition"
+                "adaptive evidence stores one exact origin-session copy"
             );
-
-            assert!(result.content.starts_with("[artifact: exec_shell]"));
-            assert!(result.content.contains("id:           art_call-big"));
-            assert!(result.content.contains("tool_call_id: call-big"));
+            assert!(result.content.starts_with("[Exact evidence retained"));
             assert!(
                 result
                     .content
-                    .contains("path:         artifacts/art_call-big.txt")
+                    .contains("retrieve_tool_result ref=art_call-big")
             );
-            assert!(!result.content.contains("Output truncated:"));
-            assert!(result.content.contains("[retained head:"));
-            assert!(result.content.contains("[retained tail:"));
+            assert!(!result.content.contains("artifacts/art_call-big.txt"));
+            assert!(
+                session_artifact
+                    .with_file_name("art_call-big.evidence.json")
+                    .exists()
+            );
 
             let metadata = result.metadata.expect("metadata stamped");
             assert_eq!(
@@ -926,8 +1086,71 @@ mod tests {
                 Some("session-123")
             );
             assert_eq!(metadata["original_byte_count"], big.len());
-            assert_eq!(metadata["retained_head_bytes"], SPILLOVER_HEAD_BYTES);
-            assert_eq!(metadata["retained_tail_bytes"], SPILLOVER_TAIL_BYTES);
+            assert!(metadata["retained_head_bytes"].as_u64().unwrap_or(0) <= 2 * 1024);
+            assert!(metadata["retained_tail_bytes"].as_u64().unwrap_or(0) <= 512);
+        });
+    }
+
+    #[test]
+    fn adaptive_evidence_keeps_success_and_failure_exact_distinct_and_out_of_context() {
+        let _g = setup();
+        let tmp = tempdir().unwrap();
+        with_test_home(tmp.path(), || {
+            let sentinel = "DEEP_RAW_SENTINEL";
+            let success_raw = format!(
+                "{}{}{}",
+                "head\n".repeat(2_000),
+                sentinel,
+                "tail\n".repeat(2_000)
+            );
+            let failure_raw = format!("{}{}", "failure\n".repeat(3_000), "FAILURE_END");
+            let mut success = ToolResult::success(success_raw.clone());
+            let mut failure = ToolResult::error(failure_raw.clone());
+
+            let success_path = apply_spillover_with_artifact(
+                &mut success,
+                "call-success",
+                "exec_shell",
+                "session-a",
+            )
+            .expect("success evidence");
+            let failure_path = apply_spillover_with_artifact(
+                &mut failure,
+                "call-failure",
+                "mcp_fixture",
+                "session-a",
+            )
+            .expect("failure evidence");
+
+            assert_ne!(success_path, failure_path);
+            assert_eq!(
+                std::fs::read(&success_path).unwrap(),
+                success_raw.as_bytes()
+            );
+            assert_eq!(
+                std::fs::read(&failure_path).unwrap(),
+                failure_raw.as_bytes()
+            );
+            assert!(!success.content.contains(sentinel));
+            assert!(success.content.len() < 4 * 1024);
+            let success_meta = success.metadata.as_ref().unwrap();
+            let failure_meta = failure.metadata.as_ref().unwrap();
+            assert_ne!(
+                success_meta["artifact_digest"],
+                failure_meta["artifact_digest"]
+            );
+            assert_eq!(success_meta["artifact_session_id"], "session-a");
+            assert_eq!(failure_meta["artifact_session_id"], "session-a");
+
+            let mut replay = ToolResult::success(success_raw);
+            let replay_path = apply_spillover_with_artifact(
+                &mut replay,
+                "call-success",
+                "exec_shell",
+                "session-a",
+            )
+            .expect("idempotent replay");
+            assert_eq!(replay_path, success_path);
         });
     }
 

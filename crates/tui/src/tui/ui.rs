@@ -2770,6 +2770,12 @@ async fn run_event_loop(
                     // pulse; it must not alter transcript or status copy.
                     EngineEvent::ToolCallHeartbeat => {}
                     EngineEvent::ToolCallComplete { id, name, result } => {
+                        if crate::tui::tool_routing::evidence_completion_should_be_ignored(
+                            app, &id, &result,
+                        ) {
+                            tracing::debug!(tool_id = %id, tool_name = %name, "ignored foreign or replayed evidence completion");
+                            continue;
+                        }
                         if name == "update_plan" {
                             app.plan_tool_used_in_turn = true;
                         }
@@ -7987,7 +7993,10 @@ async fn tool_result_content_for_api_message(
         return String::new();
     }
 
-    if matches!(name, "run_tests" | "run_verifiers" | "task_gate_run" | "tasks") {
+    if matches!(
+        name,
+        "run_tests" | "run_verifiers" | "task_gate_run" | "tasks"
+    ) {
         return crate::core::engine::compact_tool_result_for_route(
             app.api_provider,
             &app.model,

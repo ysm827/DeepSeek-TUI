@@ -45,7 +45,6 @@ use crate::tools::spec::{
 use crate::tools::todo::SharedTodoList;
 #[cfg(test)]
 use crate::tools::todo::TodoList;
-use crate::tools::truncate::{SPILLOVER_HEAD_BYTES, SPILLOVER_THRESHOLD_BYTES, maybe_spillover};
 use crate::tui::app::AppMode;
 use crate::tui::app::ReasoningEffort;
 use crate::utils::spawn_supervised;
@@ -6935,41 +6934,24 @@ async fn publish_live_subagent_transcript(
 fn bound_subagent_tool_result(
     agent_id: &str,
     tool_id: &str,
+    tool_name: &str,
+    session_id: &str,
+    success: bool,
     content: String,
 ) -> (String, Option<PathBuf>) {
-    if content.len() <= SPILLOVER_THRESHOLD_BYTES {
-        return (content, None);
-    }
     let spill_id = format!("sa_{agent_id}_{tool_id}");
-    match maybe_spillover(
+    let mut result = if success {
+        ToolResult::success(content)
+    } else {
+        ToolResult::error(content)
+    };
+    let path = crate::tools::truncate::apply_spillover_with_artifact(
+        &mut result,
         &spill_id,
-        &content,
-        SPILLOVER_THRESHOLD_BYTES,
-        SPILLOVER_HEAD_BYTES,
-    ) {
-        Ok(Some((head, path))) => {
-            let footer = format!(
-                "\n\n[Sub-agent tool output truncated: {head_kib} KiB of {total_kib} KiB shown. \
-                 Full output saved to {path}. Use `read_file` on that path if you need the \
-                 elided output.]",
-                head_kib = head.len() / 1024,
-                total_kib = content.len() / 1024,
-                path = path.display(),
-            );
-            (format!("{head}{footer}"), Some(path))
-        }
-        Ok(None) => (content, None),
-        Err(err) => {
-            tracing::warn!(
-                target: "subagent",
-                ?err,
-                agent_id,
-                tool_id,
-                "sub-agent spillover write failed; passing original content through"
-            );
-            (content, None)
-        }
-    }
+        tool_name,
+        session_id,
+    );
+    (result.content, path)
 }
 
 /// Rough serialized size of one message, used for checkpoint/transcript byte
@@ -7951,7 +7933,14 @@ async fn run_subagent(
                 Err(_) => format!("Error: Tool {tool_name} timed out"),
             };
             let tool_ok = !result.starts_with("Error:");
-            let (result, spilled_to) = bound_subagent_tool_result(&agent_id, &tool_id, result);
+            let (result, spilled_to) = bound_subagent_tool_result(
+                &agent_id,
+                &tool_id,
+                &tool_name,
+                &runtime.context.state_namespace,
+                tool_ok,
+                result,
+            );
             if let Some(path) = spilled_to.as_ref() {
                 record_agent_progress(
                     runtime,

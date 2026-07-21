@@ -36,7 +36,7 @@ impl ToolSpec for RetrieveToolResultTool {
     }
 
     fn description(&self) -> &'static str {
-        "Retrieve a previously spilled large tool result. Accepts a tool_call_id (`call_abc123`), artifact id (`art_call_abc123`), SHA reference (`sha:<64-hex>` or bare 64-hex from `<TOOL_RESULT_REF>`), relative filename (`call_abc123.txt`, `artifacts/art_call_abc123.txt`), or absolute path under ~/.codewhale. Modes: summary, head, tail, lines, query."
+        "Inspect retained tool evidence with strict session ownership and bounds. Accepts a tool_call_id, artifact id, legacy SHA reference, or validated session-relative path. Modes: metadata, summary, head, tail, lines, query, bytes. bytes returns a bounded base64 slice for exact text or binary recovery."
     }
 
     fn input_schema(&self) -> Value {
@@ -49,7 +49,7 @@ impl ToolSpec for RetrieveToolResultTool {
                 },
                 "mode": {
                     "type": "string",
-                    "enum": ["summary", "head", "tail", "lines", "query"],
+                    "enum": ["metadata", "summary", "head", "tail", "lines", "query", "bytes"],
                     "description": "Retrieval mode. Defaults to summary."
                 },
                 "query": {
@@ -83,6 +83,21 @@ impl ToolSpec for RetrieveToolResultTool {
                 "context_lines": {
                     "type": "integer",
                     "description": "Extra lines around each query match. Default 1, hard cap 5."
+                },
+                "generation": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional expected evidence generation; mismatches fail closed."
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Zero-based byte offset for mode=bytes."
+                },
+                "length": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Byte count for mode=bytes, capped at max_bytes."
                 }
             },
             "required": ["ref"]
@@ -113,8 +128,51 @@ impl ToolSpec for RetrieveToolResultTool {
             HARD_MAX_BYTES,
         );
         let path = resolve_spillover_reference(reference, &context.state_namespace)?;
-        let content = fs::read_to_string(&path).map_err(|err| {
-            ToolError::execution_failed(format!("failed to read {}: {err}", path.display()))
+        let bytes = fs::read(&path).map_err(|_| {
+            ToolError::execution_failed("evidence is missing or no longer retained")
+        })?;
+        let evidence = validate_evidence_if_present(
+            reference,
+            &path,
+            &bytes,
+            &context.state_namespace,
+            &input,
+        )?;
+        if mode == "metadata" {
+            return ToolResult::json(&json!({
+                "ref": reference,
+                "available": true,
+                "total_bytes": bytes.len(),
+                "evidence": evidence,
+            }))
+            .map_err(|err| ToolError::execution_failed(err.to_string()));
+        }
+        if mode == "bytes" {
+            use base64::Engine as _;
+            let offset = input.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let requested = input
+                .get("length")
+                .and_then(Value::as_u64)
+                .unwrap_or(max_bytes as u64) as usize;
+            let end = offset
+                .saturating_add(requested.min(max_bytes))
+                .min(bytes.len());
+            let slice = bytes.get(offset.min(bytes.len())..end).unwrap_or_default();
+            return ToolResult::json(&json!({
+                "ref": reference,
+                "mode": "bytes",
+                "offset": offset,
+                "returned_bytes": slice.len(),
+                "total_bytes": bytes.len(),
+                "encoding": "base64",
+                "data": base64::engine::general_purpose::STANDARD.encode(slice),
+            }))
+            .map_err(|err| ToolError::execution_failed(err.to_string()));
+        }
+        let content = String::from_utf8(bytes).map_err(|_| {
+            ToolError::execution_failed(
+                "evidence encoding is binary; bounded text inspection is unavailable",
+            )
         })?;
 
         let lines: Vec<&str> = content.lines().collect();
@@ -128,7 +186,7 @@ impl ToolSpec for RetrieveToolResultTool {
             "query" => build_query_payload(reference, &path, &lines, &input, max_bytes)?,
             other => {
                 return Err(ToolError::invalid_input(format!(
-                    "unsupported mode `{other}` (expected summary, head, tail, lines, or query)"
+                    "unsupported mode `{other}` (expected metadata, summary, head, tail, lines, query, or bytes)"
                 )));
             }
         };
@@ -137,6 +195,70 @@ impl ToolSpec for RetrieveToolResultTool {
             ToolError::execution_failed(format!("failed to serialize result: {err}"))
         })
     }
+}
+
+fn validate_evidence_if_present(
+    reference: &str,
+    path: &std::path::Path,
+    bytes: &[u8],
+    session_id: &str,
+    input: &Value,
+) -> Result<Option<crate::tools::large_output_router::EvidenceArtifact>, ToolError> {
+    let handle = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| stem.starts_with("art_"))
+        .or_else(|| {
+            reference
+                .trim()
+                .starts_with("art_")
+                .then(|| reference.trim())
+        });
+    let Some(handle) = handle else {
+        return Ok(None);
+    };
+    let metadata =
+        match crate::tools::large_output_router::read_evidence_metadata(session_id, handle) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(ToolError::permission_denied(
+                    "evidence belongs to another session",
+                ));
+            }
+            Err(_) => return Err(ToolError::execution_failed("evidence metadata is corrupt")),
+        };
+    if metadata.origin_session != session_id || metadata.handle != handle {
+        return Err(ToolError::permission_denied(
+            "evidence belongs to another session",
+        ));
+    }
+    if metadata.redacted {
+        return Err(ToolError::permission_denied("evidence has been redacted"));
+    }
+    if crate::tools::large_output_router::evidence_is_expired(
+        &metadata,
+        crate::tools::large_output_router::unix_millis_now(),
+    ) {
+        return Err(ToolError::execution_failed(
+            "evidence retention has expired",
+        ));
+    }
+    if input
+        .get("generation")
+        .and_then(Value::as_u64)
+        .is_some_and(|generation| generation != u64::from(metadata.generation))
+    {
+        return Err(ToolError::execution_failed(
+            "evidence generation does not match",
+        ));
+    }
+    if metadata.size_bytes != u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+        || metadata.digest != crate::hashing::sha256_hex(bytes)
+    {
+        return Err(ToolError::execution_failed("evidence content is corrupt"));
+    }
+    Ok(Some(metadata))
 }
 
 /// Resolve a tool-result ref to a concrete file path.
@@ -235,11 +357,8 @@ fn resolve_spillover_reference(reference: &str, session_id: &str) -> Result<Path
         if let Some(found) = try_path(raw_path.clone(), &mut tried) {
             return Ok(found);
         }
-        return Err(not_found(
-            reference,
-            &tried,
-            &root,
-            session_artifacts_root.as_deref(),
+        return Err(ToolError::permission_denied(
+            "evidence path is not owned by the active session",
         ));
     }
 
@@ -707,6 +826,50 @@ mod tests {
         runtime.block_on(RetrieveToolResultTool.execute(input, &context()))
     }
 
+    fn execute_tool_in_session(input: Value, session_id: &str) -> Result<ToolResult, ToolError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut context = context();
+        context.state_namespace = session_id.to_string();
+        runtime.block_on(RetrieveToolResultTool.execute(input, &context))
+    }
+
+    fn publish_test_evidence(
+        session_id: &str,
+        handle: &str,
+        bytes: &[u8],
+        expired: bool,
+    ) -> crate::tools::large_output_router::EvidenceArtifact {
+        let relative = crate::artifacts::session_artifact_relative_path(handle);
+        crate::artifacts::write_session_relative_immutable(session_id, &relative, bytes).unwrap();
+        let now = crate::tools::large_output_router::unix_millis_now();
+        let artifact = crate::tools::large_output_router::EvidenceArtifact {
+            handle: handle.to_string(),
+            digest: crate::hashing::sha256_hex(bytes),
+            size_bytes: bytes.len() as u64,
+            content_type: "application/octet-stream".to_string(),
+            tool_name: "exec_shell".to_string(),
+            call_id: handle.trim_start_matches("art_").to_string(),
+            origin_session: session_id.to_string(),
+            generation: 1,
+            redacted: false,
+            encoding: "binary".to_string(),
+            retention_state: if expired {
+                crate::tools::large_output_router::EvidenceRetentionState::Expired
+            } else {
+                crate::tools::large_output_router::EvidenceRetentionState::Live
+            },
+            created_at_unix_ms: now,
+            retain_until_unix_ms: now.saturating_add(60_000),
+            storage_path: relative,
+        };
+        crate::tools::large_output_router::publish_evidence_metadata(session_id, &artifact)
+            .unwrap();
+        artifact
+    }
+
     #[test]
     fn summary_reads_spillover_by_tool_call_id() {
         let _lock = test_lock();
@@ -725,6 +888,84 @@ mod tests {
         assert_eq!(body["mode"], "summary");
         assert!(body["signal_lines"].to_string().contains("error[E0425]"));
         assert!(body["signal_lines"].to_string().contains("warning"));
+    }
+
+    #[test]
+    fn adaptive_evidence_binary_bytes_are_exact_and_bounded() {
+        let _spill = test_lock();
+        let _artifact = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let tmp = tempdir().unwrap();
+        let _root = set_spillover_root(tmp.path().join("tool_outputs"));
+        let prior =
+            crate::artifacts::set_test_artifact_sessions_root(Some(tmp.path().join("sessions")));
+        struct Restore(Option<PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+            }
+        }
+        let _restore = Restore(prior);
+        let bytes = b"\0\xffbinary\nDEEP_SENTINEL\x80tail";
+        publish_test_evidence("session-a", "art_call-binary", bytes, false);
+
+        let result = execute_tool_in_session(
+            json!({"ref": "art_call-binary", "mode": "bytes", "offset": 0, "length": 1024}),
+            "session-a",
+        )
+        .unwrap();
+        let body: Value = serde_json::from_str(&result.content).unwrap();
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(body["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded, bytes);
+        assert_eq!(body["total_bytes"], bytes.len());
+    }
+
+    #[test]
+    fn adaptive_evidence_distinguishes_corrupt_expired_and_generation_mismatch() {
+        let _spill = test_lock();
+        let _artifact = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let tmp = tempdir().unwrap();
+        let _root = set_spillover_root(tmp.path().join("tool_outputs"));
+        let prior =
+            crate::artifacts::set_test_artifact_sessions_root(Some(tmp.path().join("sessions")));
+        struct Restore(Option<PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+            }
+        }
+        let _restore = Restore(prior);
+
+        publish_test_evidence("session-a", "art_call-expired", b"expired", true);
+        let expired = execute_tool_in_session(json!({"ref": "art_call-expired"}), "session-a")
+            .unwrap_err()
+            .to_string();
+        assert!(expired.contains("expired"), "{expired}");
+
+        let artifact = publish_test_evidence("session-a", "art_call-corrupt", b"original", false);
+        let absolute =
+            crate::artifacts::session_artifact_absolute_path("session-a", &artifact.storage_path)
+                .unwrap();
+        std::fs::write(absolute, b"changed").unwrap();
+        let corrupt = execute_tool_in_session(json!({"ref": "art_call-corrupt"}), "session-a")
+            .unwrap_err()
+            .to_string();
+        assert!(corrupt.contains("corrupt"), "{corrupt}");
+
+        publish_test_evidence("session-a", "art_call-generation", b"stable", false);
+        let mismatch = execute_tool_in_session(
+            json!({"ref": "art_call-generation", "generation": 2}),
+            "session-a",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(mismatch.contains("generation"), "{mismatch}");
     }
 
     #[test]
@@ -789,13 +1030,12 @@ mod tests {
 
         let err = execute_tool(json!({"ref": outside.display().to_string()})).unwrap_err();
 
-        // The new resolver classifies anything that fails to live under
-        // an approved root as "not found" so we don't accidentally
-        // leak whether an outside path exists on disk.
+        // Unauthorized is distinct but non-leaking: no outside path detail is
+        // echoed beyond the caller-supplied ref.
         let msg = err.to_string();
         assert!(
-            msg.contains("not found"),
-            "expected `not found` diagnostic, got: {msg}"
+            msg.contains("authorize") && msg.contains("active session"),
+            "expected non-leaking authorization diagnostic, got: {msg}"
         );
     }
 

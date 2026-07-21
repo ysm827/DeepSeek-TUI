@@ -126,7 +126,7 @@ impl ToolRegistry {
     /// Execute a tool with an optional context override.
     ///
     /// This is used for retrying tools with elevated sandbox policies.
-    /// After execution, large results are routed through the workshop (#548).
+    /// After execution, results are stamped with adaptive evidence routing.
     pub async fn execute_full_with_context(
         &self,
         name: &str,
@@ -138,14 +138,36 @@ impl ToolRegistry {
             .ok_or_else(|| ToolError::not_available(format!("tool '{name}' is not registered")))?;
 
         let ctx = context_override.unwrap_or(&self.context);
-        let result = tool.execute(input.clone(), ctx).await?;
+        let mut result = tool.execute(input.clone(), ctx).await?;
 
-        // Large-output routing (#548): if the result exceeds the threshold and
-        // the caller did not request `raw=true`, synthesise via the workshop.
+        // Adaptive evidence routing (#4619) is storage-free here because this
+        // layer does not own a call id. The engine/subagent completion boundary
+        // publishes the exact artifact. Classic workshop previews remain an
+        // explicit local rollback path.
         let raw_bypass = input.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
 
         if let Some(router) = ctx.large_output_router.as_ref() {
-            use crate::tools::large_output_router::{LargeOutputRouter, RouteDecision};
+            use crate::tools::large_output_router::{
+                LargeOutputRouter, RouteDecision, classic_output_routing_enabled,
+            };
+            if !classic_output_routing_enabled() {
+                let (routing, estimated_tokens, threshold) =
+                    router.evidence_routing(name, &result, raw_bypass);
+                let metadata = result.metadata.get_or_insert_with(|| serde_json::json!({}));
+                if let Some(object) = metadata.as_object_mut() {
+                    object.insert(
+                        "evidence_routing".to_string(),
+                        serde_json::to_value(routing)
+                            .unwrap_or_else(|_| serde_json::json!("inline")),
+                    );
+                    object.insert(
+                        "evidence_estimated_tokens".to_string(),
+                        estimated_tokens.into(),
+                    );
+                    object.insert("evidence_threshold_tokens".to_string(), threshold.into());
+                }
+                return Ok(result);
+            }
             match router.route(name, &result, raw_bypass) {
                 RouteDecision::PassThrough => {}
                 RouteDecision::Synthesise {
@@ -731,8 +753,14 @@ impl ToolRegistryBuilder {
                 "pr_attempt_record",
                 "pr_attempt_record",
             )))
-            .with_tool(Arc::new(TasksTool::alias("pr_attempt_list", "pr_attempt_list")))
-            .with_tool(Arc::new(TasksTool::alias("pr_attempt_read", "pr_attempt_read")))
+            .with_tool(Arc::new(TasksTool::alias(
+                "pr_attempt_list",
+                "pr_attempt_list",
+            )))
+            .with_tool(Arc::new(TasksTool::alias(
+                "pr_attempt_read",
+                "pr_attempt_read",
+            )))
             .with_tool(Arc::new(TasksTool::alias(
                 "pr_attempt_preflight",
                 "pr_attempt_preflight",
@@ -742,7 +770,10 @@ impl ToolRegistryBuilder {
                 "github_issue_context",
                 "issue_context",
             )))
-            .with_tool(Arc::new(GithubTool::alias("github_pr_context", "pr_context")))
+            .with_tool(Arc::new(GithubTool::alias(
+                "github_pr_context",
+                "pr_context",
+            )))
             .with_tool(Arc::new(GithubTool::alias("github_comment", "comment")))
             .with_tool(Arc::new(GithubTool::alias(
                 "github_close_issue",
@@ -800,14 +831,23 @@ impl ToolRegistryBuilder {
         self.with_tool(Arc::new(TasksTool::read_only("tasks")))
             .with_tool(Arc::new(TasksTool::alias("task_list", "list")))
             .with_tool(Arc::new(TasksTool::alias("task_read", "read")))
-            .with_tool(Arc::new(TasksTool::alias("pr_attempt_list", "pr_attempt_list")))
-            .with_tool(Arc::new(TasksTool::alias("pr_attempt_read", "pr_attempt_read")))
+            .with_tool(Arc::new(TasksTool::alias(
+                "pr_attempt_list",
+                "pr_attempt_list",
+            )))
+            .with_tool(Arc::new(TasksTool::alias(
+                "pr_attempt_read",
+                "pr_attempt_read",
+            )))
             .with_tool(Arc::new(GithubTool::read_only("github")))
             .with_tool(Arc::new(GithubTool::alias(
                 "github_issue_context",
                 "issue_context",
             )))
-            .with_tool(Arc::new(GithubTool::alias("github_pr_context", "pr_context")))
+            .with_tool(Arc::new(GithubTool::alias(
+                "github_pr_context",
+                "pr_context",
+            )))
             .with_tool(Arc::new(AutomationTool::read_only("automation")))
             .with_tool(Arc::new(AutomationTool::alias("automation_list", "list")))
             .with_tool(Arc::new(AutomationTool::alias("automation_read", "read")))
@@ -2029,7 +2069,14 @@ mod tests {
         let registry = ToolRegistryBuilder::new().with_shell_tools().build(ctx);
 
         // Legacy aliases stay callable.
-        for alias in ["exec_shell", "exec_wait", "exec_interact", "exec_shell_wait", "exec_shell_interact", "exec_shell_cancel"] {
+        for alias in [
+            "exec_shell",
+            "exec_wait",
+            "exec_interact",
+            "exec_shell_wait",
+            "exec_shell_interact",
+            "exec_shell_cancel",
+        ] {
             assert!(registry.contains(alias), "{alias} should remain callable");
         }
 
@@ -2046,7 +2093,14 @@ mod tests {
         );
 
         // All legacy aliases are hidden.
-        for alias in ["exec_shell", "exec_wait", "exec_interact", "exec_shell_wait", "exec_shell_interact", "exec_shell_cancel"] {
+        for alias in [
+            "exec_shell",
+            "exec_wait",
+            "exec_interact",
+            "exec_shell_wait",
+            "exec_shell_interact",
+            "exec_shell_cancel",
+        ] {
             assert!(
                 api_names.iter().all(|n| n != alias),
                 "{alias} should be hidden from the model catalog"

@@ -1209,13 +1209,9 @@ impl Engine {
             std::sync::Arc<
                 tokio::sync::Mutex<crate::tools::large_output_router::WorkshopVariables>,
             >,
-        > = if config.workshop.is_some() {
-            Some(std::sync::Arc::new(tokio::sync::Mutex::new(
-                crate::tools::large_output_router::WorkshopVariables::default(),
-            )))
-        } else {
-            None
-        };
+        > = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::tools::large_output_router::WorkshopVariables::default(),
+        )));
 
         // External sandbox backend (#516). Logged but non-fatal: if the
         // backend fails to construct, the engine continues with local
@@ -4108,15 +4104,12 @@ impl Engine {
             ctx = ctx.with_network_policy(decider.clone());
         }
 
-        // Wire the large-output router (#548). Only attaches when the
-        // [workshop] config table is present; sub-agents don't inherit the
-        // router (their ToolContext is built separately) to prevent recursive
-        // routing of the synthesis call itself.
-        if let Some(workshop_cfg) = self.config.workshop.as_ref()
-            && let Some(vars_arc) = self.workshop_vars.as_ref()
-        {
-            let router =
-                crate::tools::large_output_router::LargeOutputRouter::new(workshop_cfg.clone());
+        // Adaptive evidence routing is engine-native and always present.
+        // `[workshop]` only customizes thresholds; it no longer gates storage.
+        if let Some(vars_arc) = self.workshop_vars.as_ref() {
+            let router = crate::tools::large_output_router::LargeOutputRouter::new(
+                self.config.workshop.clone().unwrap_or_default(),
+            );
             ctx = ctx.with_large_output_router(router, vars_arc.clone());
         }
 

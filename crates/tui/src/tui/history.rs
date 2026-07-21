@@ -1707,26 +1707,14 @@ impl GenericToolCell {
 }
 
 /// Render the inline annotation for a tool cell whose full output was
-/// spilled to disk (#422 + #423). Produces a one-line muted hint:
-///
-/// ```text
-///   full output: /Users/you/.deepseek/tool_outputs/call-abc12.txt
-/// ```
-///
-/// Path is plain text on this branch; the OSC 8 hyperlink-wrap that
-/// makes it Cmd+click-openable lives on the OSC 8 branch (PR #515)
-/// and merges in once both PRs land on `main`. The clipboard /
-/// selection path already strips OSC 8 there, so a future enhancement
-/// stays backward-compatible.
-fn render_spillover_annotation(path: &std::path::Path, width: u16) -> Line<'static> {
-    let display = path.display().to_string();
-    let prefix = "  full output: ";
-    let budget = usize::from(width).saturating_sub(prefix.len()).max(8);
-    let truncated = truncate_text(&display, budget);
-    Line::from(vec![
-        Span::styled(prefix, Style::default().fg(palette::TEXT_MUTED)),
-        Span::styled(truncated, Style::default().fg(palette::TEXT_MUTED).italic()),
-    ])
+/// retained as exact evidence. The receipt stays calm and path-free; the
+/// activity-detail shortcut opens the verified retained file.
+fn render_spillover_annotation(_path: &std::path::Path, width: u16) -> Line<'static> {
+    let receipt = "  Exact evidence retained · Option+V to inspect";
+    Line::from(Span::styled(
+        truncate_text(receipt, usize::from(width).max(8)),
+        Style::default().fg(palette::TEXT_MUTED).italic(),
+    ))
 }
 
 fn render_command_mode(command: &str, width: u16, mode: RenderMode) -> Vec<Line<'static>> {

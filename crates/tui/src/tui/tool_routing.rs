@@ -491,6 +491,52 @@ fn record_spillover_artifact_if_any(
         ));
 }
 
+pub(super) fn evidence_completion_should_be_ignored(
+    app: &App,
+    id: &str,
+    result: &Result<ToolResult, ToolError>,
+) -> bool {
+    evidence_completion_identity_should_be_ignored(
+        app.current_session_id.as_deref(),
+        app.session_artifacts
+            .iter()
+            .map(|artifact| (artifact.id.as_str(), artifact.tool_call_id.as_str())),
+        id,
+        result,
+    )
+}
+
+fn evidence_completion_identity_should_be_ignored<'a>(
+    current_session: Option<&str>,
+    known_artifacts: impl IntoIterator<Item = (&'a str, &'a str)>,
+    id: &str,
+    result: &Result<ToolResult, ToolError>,
+) -> bool {
+    let Some(metadata) = result
+        .as_ref()
+        .ok()
+        .and_then(|result| result.metadata.as_ref())
+    else {
+        return false;
+    };
+    let origin = metadata
+        .get("artifact_session_id")
+        .and_then(serde_json::Value::as_str);
+    if let (Some(origin), Some(current)) = (origin, current_session)
+        && origin != current
+    {
+        return true;
+    }
+    metadata
+        .get("artifact_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|artifact_id| {
+            known_artifacts
+                .into_iter()
+                .any(|(known_id, known_call)| known_id == artifact_id && known_call == id)
+        })
+}
+
 /// #3031: shell/tasks tools embed the literal `"(no output)"` into successful
 /// `ToolResult` content (the model-facing transcript needs a non-empty tool
 /// result). Treat it as no output on the TUI side so the compact-mode
@@ -1655,6 +1701,32 @@ mod tests {
     use super::*;
     use crate::tools::plan::StepStatus;
     use serde_json::json;
+
+    #[test]
+    fn adaptive_evidence_late_foreign_and_duplicate_completions_are_ignored() {
+        let result = Ok(ToolResult::success("bounded").with_metadata(json!({
+            "artifact_session_id": "session-a",
+            "artifact_id": "art_call-a"
+        })));
+        assert!(evidence_completion_identity_should_be_ignored(
+            Some("session-b"),
+            std::iter::empty(),
+            "call-a",
+            &result,
+        ));
+        assert!(evidence_completion_identity_should_be_ignored(
+            Some("session-a"),
+            [("art_call-a", "call-a")],
+            "call-a",
+            &result,
+        ));
+        assert!(!evidence_completion_identity_should_be_ignored(
+            Some("session-a"),
+            std::iter::empty(),
+            "call-a",
+            &result,
+        ));
+    }
 
     #[test]
     fn web_search_presentation_reads_source_degradation_and_citation_count() {

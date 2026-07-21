@@ -2,8 +2,8 @@ use super::{
     ASSISTANT_GLYPH, ExecCell, ExecSource, GenericToolCell, HistoryCell, PlanUpdateCell,
     REASONING_CURSOR, REASONING_OPENER, REASONING_RAIL, TOOL_RUNNING_SYMBOLS,
     TOOL_STATUS_SYMBOL_MS, ToolCell, ToolStatus, TranscriptRenderOptions, USER_GLYPH,
-    WebSearchCell, assistant_label_style_for, extract_reasoning_summary, render_thinking,
-    running_status_label_with_elapsed,
+    WebSearchCell, assistant_label_style_for, extract_reasoning_summary,
+    render_spillover_annotation, render_thinking, running_status_label_with_elapsed,
 };
 use crate::deepseek_theme::Theme;
 use crate::models::{ContentBlock, Message};
@@ -42,16 +42,16 @@ fn web_search_cell_renders_receipt_source_degradation_and_citations() {
 // Below 3s the label stays "running" — quick reads/greps shouldn't
 // visually churn. From 3s onward the badge appears and ticks each
 // second so the user can tell the call hasn't hung.
-// ---- #423 spillover-path UI annotation ----
+// ---- #4619 adaptive evidence UI receipt ----
 //
 // When a tool result carries a `spillover_path` (set by the
 // tool-routing layer when the tool's `metadata.spillover_path` is
-// populated), the live render appends a one-line muted hint
-// pointing at the file. Transcript-mode replay leaves the hint
-// off because the full output is already inline.
+// populated), expanded live detail appends a calm path-free receipt.
+// Transcript-mode replay leaves the hint off because the full output is
+// already inline.
 
 #[test]
-fn render_spillover_annotation_shows_path() {
+fn compact_live_row_does_not_leak_evidence_path() {
     use std::path::PathBuf;
     let cell = GenericToolCell {
         name: "read_file".to_string(),
@@ -421,6 +421,25 @@ fn render_spillover_annotation_truncates_to_width() {
         !rendered.contains("full output:"),
         "compact live rows should omit spillover annotations: {rendered:?}"
     );
+}
+
+#[test]
+fn adaptive_evidence_receipt_is_calm_path_free_and_width_bounded() {
+    use std::path::Path;
+
+    let secret_path = Path::new("/Users/private/.codewhale/sessions/session-a/artifacts/hash.txt");
+    for width in [18_u16, 40, 80, 120] {
+        let rendered = line_to_plain(&render_spillover_annotation(secret_path, width));
+        assert!(
+            text_display_width(&rendered) <= usize::from(width),
+            "receipt exceeds width {width}: {rendered:?}"
+        );
+        assert!(!rendered.contains("/Users"));
+        assert!(!rendered.contains("hash.txt"));
+        if width >= 48 {
+            assert_eq!(rendered, "  Exact evidence retained · Option+V to inspect");
+        }
+    }
 }
 
 #[test]

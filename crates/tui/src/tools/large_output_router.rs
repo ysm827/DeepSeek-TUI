@@ -1,16 +1,14 @@
-//! Large-output routing for tool results (issue #548).
+//! Adaptive evidence routing for tool results (#4619).
 //!
-//! Any tool result whose estimated token count exceeds the configured threshold
-//! is intercepted here before it reaches the parent context. A lightweight
-//! V4-Flash synthesis sub-agent condenses the raw output; only the synthesis
-//! is returned to the parent. The raw content is stored in the workshop
-//! variable `last_tool_result` so the parent agent can call
-//! `promote_to_context` later if it needs the full text.
-//!
-//! Per-tool thresholds can override the global default. Individual tool calls
-//! may pass `raw=true` to bypass routing entirely.
+//! Results are classified as inline, hybrid, or handle-only before they enter
+//! model context. Non-inline results are published exactly once under their
+//! origin session and remain available through bounded retrieval. The earlier
+//! workshop preview behavior remains only behind the explicit classic-output
+//! rollback switch.
 
 use std::collections::HashMap;
+use std::io;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -18,8 +16,7 @@ use crate::tools::spec::ToolResult;
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
-/// Default token threshold above which a tool result is routed through the
-/// workshop. Matches the issue spec of 4 096 tokens.
+/// Default token threshold separating hybrid from handle-only evidence.
 pub const DEFAULT_LARGE_OUTPUT_THRESHOLD_TOKENS: usize = 4_096;
 
 /// Approximate characters-per-token ratio used for the heuristic estimate.
@@ -32,11 +29,10 @@ pub const WORKSHOP_LAST_TOOL_RESULT_VAR: &str = "last_tool_result";
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
-/// `[workshop]` section in `config.toml`.
+/// Existing `[workshop]` threshold configuration, retained for compatibility.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct WorkshopConfig {
-    /// Token threshold above which tool results are routed through the workshop
-    /// synthesis sub-agent. Default: [`DEFAULT_LARGE_OUTPUT_THRESHOLD_TOKENS`].
+    /// Token threshold above which results become handle-only evidence.
     #[serde(default)]
     pub large_output_threshold_tokens: Option<usize>,
 
@@ -108,9 +104,9 @@ impl LargeOutputRouter {
         Self { config }
     }
 
-    /// Decide whether `result` for `tool_name` should be synthesised.
+    /// Decide whether classic routing would synthesize `result`.
     ///
-    /// Pass `raw_bypass = true` when the tool call included `raw = true`.
+    /// This is used only by the rollback implementation.
     #[must_use]
     pub fn route(&self, tool_name: &str, result: &ToolResult, raw_bypass: bool) -> RouteDecision {
         if raw_bypass || !result.success {
@@ -126,6 +122,21 @@ impl LargeOutputRouter {
         } else {
             RouteDecision::PassThrough
         }
+    }
+
+    #[must_use]
+    pub fn evidence_routing(
+        &self,
+        tool_name: &str,
+        result: &ToolResult,
+        _raw_bypass: bool,
+    ) -> (EvidenceRouting, usize, usize) {
+        let threshold = self.config.threshold_for(tool_name);
+        let estimated_tokens = estimate_tokens(&result.content);
+        // `raw=true` no longer bypasses the context bound. Exact bytes remain
+        // available through the artifact handle, so bypass is unnecessary.
+        let routing = EvidenceRouting::from_token_estimate(estimated_tokens, threshold);
+        (routing, estimated_tokens, threshold)
     }
 
     /// Build the synthesis prompt sent to the V4-Flash workshop sub-agent.
@@ -239,6 +250,7 @@ impl EvidenceRouting {
 /// Immutable metadata for a stored evidence artifact (#4619).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidenceArtifact {
+    pub handle: String,
     pub digest: String,
     pub size_bytes: u64,
     pub content_type: String,
@@ -247,6 +259,69 @@ pub struct EvidenceArtifact {
     pub origin_session: String,
     pub generation: u32,
     pub redacted: bool,
+    pub encoding: String,
+    pub retention_state: EvidenceRetentionState,
+    pub created_at_unix_ms: u64,
+    pub retain_until_unix_ms: u64,
+    pub storage_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceRetentionState {
+    Live,
+    Expired,
+}
+
+pub const EVIDENCE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+
+#[must_use]
+pub fn classic_output_routing_enabled() -> bool {
+    std::env::var("CODEWHALE_CLASSIC_OUTPUT_ROUTING")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+}
+
+#[must_use]
+pub fn evidence_metadata_relative_path(handle: &str) -> PathBuf {
+    PathBuf::from(crate::artifacts::ARTIFACTS_DIR_NAME).join(format!("{handle}.evidence.json"))
+}
+
+pub fn publish_evidence_metadata(
+    session_id: &str,
+    artifact: &EvidenceArtifact,
+) -> io::Result<PathBuf> {
+    let bytes = serde_json::to_vec_pretty(artifact)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    crate::artifacts::write_session_relative_immutable(
+        session_id,
+        &evidence_metadata_relative_path(&artifact.handle),
+        &bytes,
+    )
+}
+
+pub fn read_evidence_metadata(session_id: &str, handle: &str) -> io::Result<EvidenceArtifact> {
+    let relative = evidence_metadata_relative_path(handle);
+    let path = crate::artifacts::session_artifact_absolute_path(session_id, &relative)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "invalid evidence owner"))?;
+    let raw = std::fs::read(path)?;
+    serde_json::from_slice(&raw).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+#[must_use]
+pub fn unix_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+#[must_use]
+pub fn evidence_is_expired(artifact: &EvidenceArtifact, now_ms: u64) -> bool {
+    artifact.retention_state == EvidenceRetentionState::Expired
+        || now_ms > artifact.retain_until_unix_ms
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -292,6 +367,14 @@ mod tests {
             router.route("exec_shell", &result, true),
             RouteDecision::PassThrough
         );
+    }
+
+    #[test]
+    fn adaptive_evidence_cannot_bypass_context_bound_with_raw_flag() {
+        let router = LargeOutputRouter::default();
+        let big = make_result(&"a".repeat(13_000));
+        let (routing, _, _) = router.evidence_routing("exec_shell", &big, true);
+        assert_eq!(routing, EvidenceRouting::HandleOnly);
     }
 
     #[test]

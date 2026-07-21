@@ -9057,13 +9057,19 @@ fn with_spillover_root<F: FnOnce()>(root: &std::path::Path, f: F) {
         .lock()
         .unwrap_or_else(|err| err.into_inner());
     let prior = crate::tools::truncate::set_test_spillover_root(Some(root.to_path_buf()));
-    struct Restore(Option<std::path::PathBuf>);
+    let _artifact_guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let prior_artifacts =
+        crate::artifacts::set_test_artifact_sessions_root(Some(root.join("sessions")));
+    struct Restore(Option<std::path::PathBuf>, Option<std::path::PathBuf>);
     impl Drop for Restore {
         fn drop(&mut self) {
             crate::tools::truncate::set_test_spillover_root(self.0.take());
+            crate::artifacts::set_test_artifact_sessions_root(self.1.take());
         }
     }
-    let _restore = Restore(prior);
+    let _restore = Restore(prior, prior_artifacts);
     f();
 }
 
@@ -9282,32 +9288,50 @@ fn subagent_tool_results_spill_to_disk_and_stay_bounded_inline() {
         let raw = "cargo build noise line\n".repeat(220_000); // ~5 MB
         let raw_len = raw.len();
 
-        let (inline, spilled) =
-            bound_subagent_tool_result("fleet-worker-1", "call-42", raw.clone());
+        let (inline, spilled) = bound_subagent_tool_result(
+            "fleet-worker-1",
+            "call-42",
+            "exec_shell",
+            "session-test",
+            true,
+            raw.clone(),
+        );
 
         let path = spilled.expect("multi-MB output must spill");
         // Model-visible content is bounded to head + footer.
-        assert!(inline.len() <= crate::tools::truncate::SPILLOVER_HEAD_BYTES + 1024);
-        assert!(inline.contains("Sub-agent tool output truncated"));
-        assert!(inline.contains(&path.display().to_string()));
-        assert!(inline.contains("read_file"));
+        assert!(inline.len() <= 4 * 1024);
+        assert!(inline.contains("Exact evidence retained"));
+        assert!(!inline.contains(&path.display().to_string()));
+        assert!(inline.contains("retrieve_tool_result"));
         // Full output remains recoverable from disk.
         let on_disk = std::fs::read_to_string(&path).expect("spill file readable");
         assert_eq!(on_disk.len(), raw_len);
 
         // Small outputs pass through untouched, no spill file.
-        let (small, spilled) =
-            bound_subagent_tool_result("fleet-worker-1", "call-43", "ok".to_string());
+        let (small, spilled) = bound_subagent_tool_result(
+            "fleet-worker-1",
+            "call-43",
+            "read_file",
+            "session-test",
+            true,
+            "ok".to_string(),
+        );
         assert_eq!(small, "ok");
         assert!(spilled.is_none());
 
         // Oversized error output is bounded too: sub-agent errors are
         // routinely full build logs, unlike the root loop's short errors.
-        let (bounded_err, spilled) =
-            bound_subagent_tool_result("fleet-worker-1", "call-44", format!("Error: {raw}"));
+        let (bounded_err, spilled) = bound_subagent_tool_result(
+            "fleet-worker-1",
+            "call-44",
+            "exec_shell",
+            "session-test",
+            false,
+            format!("Error: {raw}"),
+        );
         assert!(spilled.is_some());
-        assert!(bounded_err.len() <= crate::tools::truncate::SPILLOVER_HEAD_BYTES + 1024);
-        assert!(bounded_err.starts_with("Error:"));
+        assert!(bounded_err.len() <= 4 * 1024);
+        assert!(bounded_err.contains("Exact evidence retained"));
     });
 }
 
@@ -9325,8 +9349,14 @@ fn fanout_of_workers_with_huge_outputs_keeps_resident_state_bounded() {
             let agent_id = format!("fleet-worker-{worker}");
             let mut messages = Vec::new();
             for call in 0..3 {
-                let (inline, spilled) =
-                    bound_subagent_tool_result(&agent_id, &format!("call-{call}"), huge.clone());
+                let (inline, spilled) = bound_subagent_tool_result(
+                    &agent_id,
+                    &format!("call-{call}"),
+                    "exec_shell",
+                    "session-test",
+                    true,
+                    huge.clone(),
+                );
                 let path = spilled.expect("should spill");
                 assert_eq!(
                     std::fs::read_to_string(&path).expect("readable").len(),
