@@ -42,7 +42,9 @@ pub(crate) struct ModelRouteCandidate {
 pub(crate) struct ModelInventory {
     pub(crate) active_provider: ApiProvider,
     pub(crate) router_provider: ApiProvider,
-    pub(crate) router_model: &'static str,
+    pub(crate) router_model: String,
+    /// Thinking tier for the classifier call (None = off) (#auto.router).
+    pub(crate) router_thinking: Option<String>,
     pub(crate) router_available: bool,
     pub(crate) candidates: Vec<ModelRouteCandidate>,
 }
@@ -146,11 +148,36 @@ impl ModelInventory {
             }
         }
 
+        // [auto.router]: an explicit classifier route wins over the legacy
+        // DeepSeek flash default. When unset, keep the historic behavior:
+        // deepseek-v4-flash when a DeepSeek key exists, else heuristic-only.
+        let (router_provider, router_model, router_thinking) = config
+            .auto
+            .as_ref()
+            .and_then(|auto| auto.router.as_ref())
+            .and_then(|router| {
+                let provider = router.provider.as_deref().and_then(ApiProvider::parse)?;
+                let model = router.model.as_deref().map(str::trim).filter(|m| !m.is_empty())?;
+                Some((
+                    provider,
+                    model.to_string(),
+                    router.thinking.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string),
+                ))
+            })
+            .unwrap_or_else(|| {
+                (
+                    ApiProvider::Deepseek,
+                    "deepseek-v4-flash".to_string(),
+                    None,
+                )
+            });
+
         Self {
             active_provider,
-            router_provider: ApiProvider::Deepseek,
-            router_model: "deepseek-v4-flash",
-            router_available: has_api_key_for(config, ApiProvider::Deepseek),
+            router_provider,
+            router_available: has_api_key_for(config, router_provider),
+            router_model,
+            router_thinking,
             candidates,
         }
     }
@@ -561,6 +588,34 @@ mod tests {
     }
 
     #[test]
+    fn auto_router_config_overrides_default_classifier_route() {
+        let config = Config {
+            auto: Some(crate::config::AutoConfig {
+                cost_saving: None,
+                router: Some(crate::config::AutoRouterConfig {
+                    provider: Some("zai".to_string()),
+                    model: Some("glm-5-turbo".to_string()),
+                    thinking: Some("low".to_string()),
+                }),
+            }),
+            ..Default::default()
+        };
+
+        let inventory = ModelInventory::from_config(&config);
+        assert_eq!(inventory.router_provider, ApiProvider::Zai);
+        assert_eq!(inventory.router_model, "glm-5-turbo");
+        assert_eq!(inventory.router_thinking.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn auto_router_config_defaults_to_deepseek_flash_when_unset() {
+        let inventory = ModelInventory::from_config(&Config::default());
+        assert_eq!(inventory.router_provider, ApiProvider::Deepseek);
+        assert_eq!(inventory.router_model, "deepseek-v4-flash");
+        assert_eq!(inventory.router_thinking, None);
+    }
+
+    #[test]
     fn inventory_marks_explicit_no_auth_separately_from_keyless_local() {
         let mut providers = crate::config::ProvidersConfig::default();
         providers.vllm.auth_mode = Some("none".to_string());
@@ -615,7 +670,8 @@ mod tests {
         let inventory = ModelInventory {
             active_provider: ApiProvider::Openai,
             router_provider: ApiProvider::Deepseek,
-            router_model: "deepseek-v4-flash",
+            router_model: "deepseek-v4-flash".to_string(),
+            router_thinking: None,
             router_available: false,
             candidates: vec![ModelRouteCandidate {
                 provider: ApiProvider::Openai,

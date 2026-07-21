@@ -1975,6 +1975,28 @@ pub struct SubagentProviderConfig {
 pub struct AutoConfig {
     #[serde(default)]
     pub cost_saving: Option<bool>,
+    /// Optional explicit auto-router classifier route (`[auto.router]`).
+    #[serde(default)]
+    pub router: Option<AutoRouterConfig>,
+}
+
+/// Explicit classifier route for Auto model mode (`[auto.router]`).
+///
+/// When `provider` + `model` are set, Auto mode's classifier call goes to
+/// that route instead of the built-in DeepSeek flash default. When unset,
+/// the legacy behavior stands: `deepseek-v4-flash` via DeepSeek when a
+/// DeepSeek key exists, else the local heuristic with no classifier call.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AutoRouterConfig {
+    /// Provider id for the classifier route (e.g. `"deepseek"`, `"zai"`).
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model id on that provider (e.g. `"deepseek-v4-flash"`).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Thinking tier for the classifier call (e.g. `"off"`). Defaults to off.
+    #[serde(default)]
+    pub thinking: Option<String>,
 }
 
 fn default_update_check_for_updates() -> bool {

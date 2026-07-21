@@ -501,6 +501,29 @@ auto-select MiMo endpoints. Use
 `https://token-plan-cn.xiaomimimo.com/v1` for China-region accounts, or
 `https://token-plan-ams.xiaomimimo.com/v1` for Europe/Amsterdam accounts.
 
+### Auto Model Routing (`[auto.router]`)
+
+With `model = "auto"`, Codewhale routes each turn between a strong and a cheap
+model. The routing decision comes from a small classifier call, or from a local
+heuristic when no classifier route is available.
+
+By default the classifier is `deepseek-v4-flash` via DeepSeek, used only when a
+DeepSeek key is configured; every other setup falls back to the local heuristic
+with no classifier call. Point the classifier at any configured provider with
+`[auto.router]`:
+
+```toml
+[auto.router]
+provider = "zai"
+model = "glm-5-turbo"
+thinking = "off"        # optional; defaults to off
+```
+
+When `[auto.router]` is unset, the DeepSeek-flash default applies; when the
+configured route has no credentials, Auto mode falls back to the heuristic
+instead of failing. The turn's route receipt (`/status` → Auto) records
+whether the classifier or the heuristic decided.
+
 To bootstrap MCP and skills directories at their resolved paths, run `codewhale-tui setup`.
 To only scaffold MCP, run `codewhale-tui mcp init`.
 

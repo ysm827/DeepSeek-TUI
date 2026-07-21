@@ -825,8 +825,10 @@ async fn auto_route_inventory_recommendation(
     selected_thinking_mode: &str,
 ) -> Result<Option<InventoryAutoRouteRecommendation>> {
     let mut router_config = config.clone();
-    router_config.provider = Some(ApiProvider::Deepseek.as_str().to_string());
-    router_config.default_text_model = Some(inventory.router_model.to_string());
+    // The classifier runs on the inventory's router route: the explicit
+    // [auto.router] route when configured, else the DeepSeek flash default.
+    router_config.provider = Some(inventory.router_provider.as_str().to_string());
+    router_config.default_text_model = Some(inventory.router_model.clone());
 
     let client = DeepSeekClient::new(&router_config)?;
     let router_system = inventory_auto_router_system_prompt(inventory, config.auto_cost_saving());
@@ -853,7 +855,12 @@ async fn auto_route_inventory_recommendation(
         tool_choice: None,
         metadata: None,
         thinking: None,
-        reasoning_effort: Some("off".to_string()),
+        reasoning_effort: Some(
+            inventory
+                .router_thinking
+                .clone()
+                .unwrap_or_else(|| "off".to_string()),
+        ),
         stream: Some(false),
         temperature: Some(0.0),
         top_p: None,
@@ -1521,6 +1528,7 @@ mod tests {
         let cost_saving = Config {
             auto: Some(crate::config::AutoConfig {
                 cost_saving: Some(true),
+                router: None,
             }),
             ..balanced.clone()
         };
@@ -1789,6 +1797,7 @@ mod tests {
         let cfg = Config {
             auto: Some(crate::config::AutoConfig {
                 cost_saving: Some(true),
+                router: None,
             }),
             ..Default::default()
         };
