@@ -13,7 +13,8 @@ The Codewhale v0.9.1 source candidate includes a first-class local web client ov
 first-class OpenCode Go and TelecomJS TokenHub providers and restored xAI device login,
 calendar-correct hourly automations, a buildable OpenHarmony workflow-js
 target, and hardening for Auto routing, remote-terminal clipboard transport,
-restart recovery, and the community site's content boundaries.
+restart recovery, and a coherent TUI, Work, evidence, and public release
+surface.
 
 ### Added
 
@@ -54,6 +55,16 @@ restart recovery, and the community site's content boundaries.
   bounded duplicate/shadow/conflict auditing, package provenance, and
   validated install, update, remove, and trust mutations (PR #4679 by
   @SamhandsomeLee).
+- Add a safe Agent Details view and bounded, structured `current_activity` to
+  the single Work projection, sourced from worker events instead of renderer
+  string inference. Rows stay compact, exact evidence is opt-in, and raw child
+  output never enters the parent transcript (#2889 and #4636; design direction
+  by @aboimpinto, preserved from #2694).
+- Make exact results and delegated coordination durable: non-inline tool output
+  becomes immutable session-owned evidence behind bounded receipts; File
+  mutations add configurable success-only diffs; and decisions and write
+  contention survive restart with typed neutral-fan-in records (#4619, #4636,
+  #4647).
 - Runtime API provider registry and atomic provider-switch endpoints
   (`GET /v1/providers`, `GET /v1/providers/{id}/models`,
   `POST /v1/providers/{id}/switch`) so the web GUI renders a dynamic
@@ -67,6 +78,18 @@ restart recovery, and the community site's content boundaries.
 
 ### Changed
 
+- Simplify the model-facing runtime around stable action tools (`File`, `Git`,
+  `Run`, deferred `Web`, and durable task and automation families), with legacy
+  spellings hidden for replay. Fresh sessions no longer reserve a Work surface
+  before real work exists (PR #4675).
+- Give the terminal shell one deliberate visual language: cool Plan → Act →
+  Operate and warm Ask → Auto-Review → Full Access ramps match between header
+  and split composer edges; transcript rhythm groups related activity; a
+  refined whale keeps the empty state calm; and one-cell live motion with
+  truthful labels distinguishes reasoning, reading, tool use, and verification
+  without exposing private reasoning text. Reduced-motion and animation-off
+  settings freeze it, while ASCII-safe terminals retain the signal (#4676,
+  #4677).
 - Unified shell tool: the model now sees a single `Bash` tool with an `action`
   parameter (run/wait/interact/cancel). Legacy `exec_shell*` names remain as
   hidden compat aliases for transcript replay, and the tool-search catalog
@@ -258,6 +281,12 @@ Thank you to the contributors whose code, reports, and reviews shaped v0.9.1:
   acceptance coverage (PR #4679), plus Enter-send lag diagnosis and fix
   direction for #4605 (PR #4654; landed via the release-lane async-dispatch
   split).
+- [@aboimpinto](https://github.com/aboimpinto) — the exact authored Layer 5.1
+  user-command registry boundary and acceptance audit from PR #4046, preserved
+  intact in the integration graph and completed with the metadata and
+  malformed-sibling follow-ups it identified; the structured, redacted Agent
+  Details and `current_activity` direction preserved from #2694/#2889; and the
+  real-PTY lifecycle acceptance direction from #2886.
 - [@baendlorel](https://github.com/baendlorel) — TelecomJS TokenHub provider
   support and key-scoped live-catalog direction from PR #4370, harvested into
   the current provider architecture with co-authorship preserved.
