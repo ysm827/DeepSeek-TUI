@@ -1285,6 +1285,29 @@ pub struct ContextProjectionReceipt {
     pub sequence: u64,
 }
 
+/// Admission outcome persisted with a write-contention receipt.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteContentionDisposition {
+    BlockedPendingIsolationOrSerialization,
+}
+
+impl WriteContentionDisposition {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BlockedPendingIsolationOrSerialization => {
+                "blocked_pending_isolation_or_serialization"
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn blocks_admission(self) -> bool {
+        matches!(self, Self::BlockedPendingIsolationOrSerialization)
+    }
+}
+
 /// Durable non-secret receipt emitted when two active shared-workspace claims
 /// collide. Rejected scope expansion remains visible after restart.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1294,7 +1317,7 @@ pub struct WriteContentionReceipt {
     pub roots: Vec<String>,
     pub exact_files: Vec<String>,
     pub contracts: Vec<String>,
-    pub disposition: String,
+    pub disposition: WriteContentionDisposition,
     pub sequence: u64,
 }
 
@@ -1569,7 +1592,7 @@ impl CoordinationLedger {
                     roots: claim.roots.clone(),
                     exact_files: claim.exact_files.clone(),
                     contracts: claim.contracts.clone(),
-                    disposition: "blocked_pending_isolation_or_serialization".to_string(),
+                    disposition: WriteContentionDisposition::BlockedPendingIsolationOrSerialization,
                     sequence: self.next_sequence(),
                 };
                 self.contentions.push(receipt);
@@ -1956,7 +1979,6 @@ impl CoordinationLedger {
                 "contention conflicting owner",
                 &contention.conflicting_owner,
             )?;
-            bounded_coordination_atom("contention disposition", &contention.disposition)?;
             if normalize_claim_paths(&contention.roots)? != contention.roots
                 || normalize_claim_paths(&contention.exact_files)? != contention.exact_files
                 || normalize_claim_strings(&contention.contracts, 16, 128, "contracts")?
@@ -2583,6 +2605,14 @@ mod records_tests {
         assert_eq!(ledger.contentions.len(), 1);
         assert_eq!(ledger.contentions[0].claimant, "agent-b");
         assert_eq!(ledger.contentions[0].conflicting_owner, "agent-a");
+        assert_eq!(
+            ledger.contentions[0].disposition,
+            WriteContentionDisposition::BlockedPendingIsolationOrSerialization
+        );
+        assert_eq!(
+            serde_json::to_value(&ledger.contentions[0]).unwrap()["disposition"],
+            json!("blocked_pending_isolation_or_serialization")
+        );
         assert!(
             ledger
                 .register_claim(second, true, |owner| owner == "agent-a")

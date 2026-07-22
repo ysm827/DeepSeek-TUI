@@ -1009,7 +1009,7 @@
     "CoordinationSummaryReconciled": "조정 완료 {count}개",
     "CoordinationSchema": "스키마 {value}",
     "CoordinationSequence": "시퀀스 {value}",
-    "CoordinationBoundedRecords": "최대 {count}개 레코드",
+    "CoordinationPerSectionLimit": "섹션당 최대 {limit}개",
     "CoordinationDecisionsHeading": "결정",
     "CoordinationNone": "없음",
     "CoordinationNoneValue": "없음",

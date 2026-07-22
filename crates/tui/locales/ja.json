@@ -1009,7 +1009,7 @@
     "CoordinationSummaryReconciled": "{count} 件を調整済み",
     "CoordinationSchema": "スキーマ {value}",
     "CoordinationSequence": "シーケンス {value}",
-    "CoordinationBoundedRecords": "最大 {count} 件",
+    "CoordinationPerSectionLimit": "各セクション最大 {limit} 件",
     "CoordinationDecisionsHeading": "決定",
     "CoordinationNone": "なし",
     "CoordinationNoneValue": "なし",

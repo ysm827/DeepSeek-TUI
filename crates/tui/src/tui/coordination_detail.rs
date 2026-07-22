@@ -33,6 +33,16 @@ pub(crate) fn needs_attention(projection: &CoordinationDetailProjection) -> bool
             .reconciliations
             .iter()
             .any(|receipt| receipt.verification_outcome != "verified")
+        || projection.contentions.iter().any(|contention| {
+            // The ledger's only disposition producer rejects admission. Its
+            // durable receipt remains current until this claimant records a
+            // later successful claim; sequence is the persisted ordering
+            // contract, so absent proof of resolution stays fail-closed.
+            contention.disposition.blocks_admission()
+                && !projection.write_claims.iter().any(|claim| {
+                    claim.claim.owner == contention.claimant && claim.sequence > contention.sequence
+                })
+        })
 }
 
 /// Format the durable coordination projection for the shared Work pager.
@@ -50,8 +60,8 @@ pub(crate) fn format(locale: Locale, projection: &CoordinationDetailProjection) 
             .replace("{value}", &projection.schema_version.to_string()),
         tr(locale, MessageId::CoordinationSequence)
             .replace("{value}", &projection.sequence.to_string()),
-        tr(locale, MessageId::CoordinationBoundedRecords)
-            .replace("{count}", &projection.limit.to_string())
+        tr(locale, MessageId::CoordinationPerSectionLimit)
+            .replace("{limit}", &projection.limit.to_string())
     );
 
     section(
@@ -131,7 +141,7 @@ pub(crate) fn format(locale: Locale, projection: &CoordinationDetailProjection) 
                 tr(locale, MessageId::CoordinationContracts)
                     .replace("{contracts}", &joined_or_none(locale, &receipt.contracts)),
                 tr(locale, MessageId::CoordinationDisposition)
-                    .replace("{disposition}", &receipt.disposition)
+                    .replace("{disposition}", receipt.disposition.as_str())
             );
         }
     }
@@ -268,7 +278,7 @@ mod tests {
     use super::*;
     use crate::tools::subagent::coord::{
         ContextProjectionReceipt, CoordinationDetailMetrics, CoordinationHotPath, DecisionRecord,
-        PersistedWriteClaim, WriteContentionReceipt, WriteScopeClaim,
+        PersistedWriteClaim, WriteContentionDisposition, WriteContentionReceipt, WriteScopeClaim,
     };
 
     fn projection() -> CoordinationDetailProjection {
@@ -325,7 +335,7 @@ mod tests {
                 roots: vec!["crates/tui".to_string()],
                 exact_files: vec!["Cargo.toml".to_string()],
                 contracts: vec!["ui-contract".to_string()],
-                disposition: "blocked_pending_isolation_or_serialization".to_string(),
+                disposition: WriteContentionDisposition::BlockedPendingIsolationOrSerialization,
                 sequence: 5,
             }],
             metrics: CoordinationDetailMetrics {
@@ -346,6 +356,7 @@ mod tests {
     fn formatter_uses_typed_receipts_without_transcript_shaped_fields() {
         let text = format(Locale::En, &projection());
         for required in [
+            "Schema 1 · sequence 9 · up to 24 per section",
             "decision-ui · composer edges",
             "status accepted · owner planner · version 3",
             "claimant worker-b · owner worker-a",
@@ -362,6 +373,7 @@ mod tests {
             assert!(text.contains(required), "missing {required}:\n{text}");
         }
         assert!(!text.contains("PRIVATE-TRANSCRIPT-MARKER"), "{text}");
+        assert!(!text.contains("bounded to 24 records"), "{text}");
         assert!(!text.contains("hidden-evidence"), "{text}");
         assert!(!text.contains("ignored"), "{text}");
     }
@@ -399,13 +411,32 @@ mod tests {
     }
 
     #[test]
-    fn attention_comes_from_typed_status_and_verification_only() {
+    fn proposed_decisions_and_unverified_reconciliation_need_attention() {
         let mut value = projection();
+        value.contentions.clear();
         assert!(!needs_attention(&value));
         value.decisions[0].status = DecisionStatus::Proposed;
         assert!(needs_attention(&value));
         value.decisions[0].status = DecisionStatus::Accepted;
         value.reconciliations[0].verification_outcome = "blocked".to_string();
         assert!(needs_attention(&value));
+    }
+
+    #[test]
+    fn blocked_contention_needs_attention_until_a_newer_claim_resolves_it() {
+        let mut value = projection();
+        assert!(needs_attention(&value));
+
+        value.write_claims.push(PersistedWriteClaim {
+            claim: WriteScopeClaim {
+                owner: "worker-b".to_string(),
+                roots: vec!["crates/tui".to_string()],
+                exact_files: Vec::new(),
+                contracts: vec!["ui-contract".to_string()],
+            },
+            sequence: 6,
+            isolated_worktree: true,
+        });
+        assert!(!needs_attention(&value));
     }
 }

@@ -1009,7 +1009,7 @@
     "CoordinationSummaryReconciled": "{count} mục đã hòa giải",
     "CoordinationSchema": "Lược đồ {value}",
     "CoordinationSequence": "trình tự {value}",
-    "CoordinationBoundedRecords": "giới hạn ở {count} bản ghi",
+    "CoordinationPerSectionLimit": "tối đa {limit} mục mỗi phần",
     "CoordinationDecisionsHeading": "Các quyết định",
     "CoordinationNone": "Không có",
     "CoordinationNoneValue": "không có",

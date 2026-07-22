@@ -1009,7 +1009,7 @@
     "CoordinationSummaryReconciled": "{count} 项已调和",
     "CoordinationSchema": "架构 {value}",
     "CoordinationSequence": "序列 {value}",
-    "CoordinationBoundedRecords": "限制为 {count} 条记录",
+    "CoordinationPerSectionLimit": "每个部分最多 {limit} 条",
     "CoordinationDecisionsHeading": "决策",
     "CoordinationNone": "无",
     "CoordinationNoneValue": "无",

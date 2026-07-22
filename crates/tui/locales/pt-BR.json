@@ -1009,7 +1009,7 @@
     "CoordinationSummaryReconciled": "{count} reconciliações",
     "CoordinationSchema": "Esquema {value}",
     "CoordinationSequence": "sequência {value}",
-    "CoordinationBoundedRecords": "limitado a {count} registros",
+    "CoordinationPerSectionLimit": "até {limit} por seção",
     "CoordinationDecisionsHeading": "Decisões",
     "CoordinationNone": "Nenhuma",
     "CoordinationNoneValue": "nenhum",

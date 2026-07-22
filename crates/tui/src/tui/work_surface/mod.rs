@@ -291,6 +291,64 @@ mod tests {
     }
 
     #[test]
+    fn current_blocked_contention_uses_attention_bucket_mark_and_tone() {
+        use crate::tools::subagent::CoordinationDetailProjection;
+        use crate::tools::subagent::coord::{
+            CoordinationDetailMetrics, PersistedWriteClaim, WriteContentionDisposition,
+            WriteContentionReceipt, WriteScopeClaim,
+        };
+
+        let mut app = app();
+        app.coordination_detail = Some(CoordinationDetailProjection {
+            schema_version: 1,
+            sequence: 2,
+            decisions: Vec::new(),
+            write_claims: vec![PersistedWriteClaim {
+                claim: WriteScopeClaim {
+                    owner: "worker-a".to_string(),
+                    roots: vec!["crates/tui".to_string()],
+                    exact_files: Vec::new(),
+                    contracts: vec!["ui-contract".to_string()],
+                },
+                sequence: 1,
+                isolated_worktree: false,
+            }],
+            reconciliations: Vec::new(),
+            context_projections: Vec::new(),
+            contentions: vec![WriteContentionReceipt {
+                claimant: "worker-b".to_string(),
+                conflicting_owner: "worker-a".to_string(),
+                roots: vec!["crates/tui".to_string()],
+                exact_files: Vec::new(),
+                contracts: vec!["ui-contract".to_string()],
+                disposition: WriteContentionDisposition::BlockedPendingIsolationOrSerialization,
+                sequence: 2,
+            }],
+            metrics: CoordinationDetailMetrics {
+                hottest_paths: Vec::new(),
+                package_or_module_growth: None,
+                route_or_cost: None,
+                note: "No authoritative metric source".to_string(),
+            },
+            bounded: true,
+            limit: 24,
+        });
+
+        let rows = super::model::project(&mut app);
+        assert_eq!(
+            rows[0].label,
+            "Work · 0 active · 1 needs input · 0 ready · 0 recent"
+        );
+        let row = rows
+            .iter()
+            .find(|row| row.id.0 == "coordination")
+            .expect("blocked coordination Work row");
+        assert_eq!(row.mark, crate::tui::glyphs::ATTENTION);
+        assert_eq!(row.tone, super::model::WorkTone::Attention);
+        assert_eq!(row.detail, "0 decisions · 1 contentions · 0 reconciled");
+    }
+
+    #[test]
     fn todos_share_one_ordered_work_projection_without_a_second_heading() {
         let mut app = app();
         {
