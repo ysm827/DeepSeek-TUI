@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
+use super::diff_format::make_unified_diff;
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     lsp_diagnostics_for_paths, optional_bool, optional_str, optional_u64,
@@ -383,8 +384,11 @@ impl ToolSpec for ApplyPatchTool {
             };
             let mut tool_result = ToolResult::json(&result)
                 .map_err(|e| ToolError::execution_failed(e.to_string()))?;
-            tool_result =
-                tool_result.with_metadata(apply_patch_preflight_metadata(&preflight.summary));
+            tool_result = tool_result.with_metadata(apply_patch_result_metadata(
+                &preflight.summary,
+                &pending,
+                &stats,
+            ));
             if !diag_block.is_empty() {
                 tool_result.content.push('\n');
                 tool_result.content.push_str(&diag_block);
@@ -429,7 +433,11 @@ impl ToolSpec for ApplyPatchTool {
         };
         let mut tool_result =
             ToolResult::json(&result).map_err(|e| ToolError::execution_failed(e.to_string()))?;
-        tool_result = tool_result.with_metadata(apply_patch_preflight_metadata(&preflight.summary));
+        tool_result = tool_result.with_metadata(apply_patch_result_metadata(
+            &preflight.summary,
+            &pending,
+            &stats,
+        ));
         if !diag_block.is_empty() {
             tool_result.content.push('\n');
             tool_result.content.push_str(&diag_block);
@@ -572,13 +580,100 @@ fn preflight_replace(
     })
 }
 
-fn apply_patch_preflight_metadata(preflight: &ApplyPatchPreflight) -> Value {
+fn apply_patch_result_metadata(
+    preflight: &ApplyPatchPreflight,
+    pending: &[PendingWrite],
+    stats: &PatchStatsExt,
+) -> Value {
     let mut metadata =
         serde_json::to_value(preflight).expect("ApplyPatchPreflight should serialize");
     if let Some(object) = metadata.as_object_mut() {
         object.insert("event".to_string(), json!("apply_patch.preflight"));
+        object.insert(
+            "mutation".to_string(),
+            build_mutation_metadata(pending, &stats.file_summaries),
+        );
     }
     metadata
+}
+
+/// Preserve the exact applied before/after diff independently from approval
+/// presentation. The TUI consumes this success-only metadata for its calm
+/// File receipt; the normal model-facing result remains compact JSON.
+fn build_mutation_metadata(pending: &[PendingWrite], summaries: &[FileSummary]) -> Value {
+    let mut matched = HashSet::new();
+    let mut renames = Vec::new();
+
+    for (delete_index, (deleted, delete_summary)) in pending.iter().zip(summaries).enumerate() {
+        if !delete_summary.deleted || matched.contains(&delete_index) {
+            continue;
+        }
+        let Some(old_content) = deleted.original.as_deref() else {
+            continue;
+        };
+        let Some((create_index, (_, create_summary))) = pending
+            .iter()
+            .zip(summaries)
+            .enumerate()
+            .find(|(index, (created, summary))| {
+                !matched.contains(index)
+                    && summary.created
+                    && created.content.as_deref() == Some(old_content)
+            })
+        else {
+            continue;
+        };
+        matched.insert(delete_index);
+        matched.insert(create_index);
+        renames.push(json!({
+            "from": delete_summary.path,
+            "to": create_summary.path,
+        }));
+    }
+
+    let mut files = Vec::new();
+    for (index, summary) in summaries.iter().enumerate() {
+        if matched.contains(&index) {
+            continue;
+        }
+        let outcome = if summary.created {
+            "created"
+        } else if summary.deleted {
+            "deleted"
+        } else {
+            "updated"
+        };
+        files.push(json!({ "path": summary.path, "outcome": outcome }));
+    }
+
+    let mut diff_parts = Vec::new();
+    for rename in &renames {
+        let from = rename["from"].as_str().unwrap_or("<file>");
+        let to = rename["to"].as_str().unwrap_or("<file>");
+        diff_parts.push(format!(
+            "diff --git a/{from} b/{to}\nsimilarity index 100%\nrename from {from}\nrename to {to}\n"
+        ));
+    }
+    for (index, (write, summary)) in pending.iter().zip(summaries).enumerate() {
+        if matched.contains(&index) {
+            continue;
+        }
+        let old = write.original.as_deref().unwrap_or("");
+        let new = write.content.as_deref().unwrap_or("");
+        let diff = make_unified_diff(&summary.path, old, new);
+        if !diff.is_empty() {
+            diff_parts.push(format!(
+                "diff --git a/{path} b/{path}\n{diff}",
+                path = summary.path
+            ));
+        }
+    }
+
+    json!({
+        "diff": diff_parts.join("\n"),
+        "files": files,
+        "renames": renames,
+    })
 }
 
 /// Parse a unified diff into hunks
@@ -1666,6 +1761,17 @@ diff --git a/same.txt b/same.txt
                 .get("path_override")
                 .is_some()
         );
+        let mutation = &result.metadata.as_ref().unwrap()["mutation"];
+        assert_eq!(
+            mutation["files"],
+            json!([{ "path": "test.txt", "outcome": "updated" }])
+        );
+        assert!(
+            mutation["diff"]
+                .as_str()
+                .is_some_and(|diff| diff.contains("-line2") && diff.contains("+modified")),
+            "{mutation}"
+        );
         let patch_result = parse_patch_result(result);
         assert_eq!(patch_result.touched_files, vec!["test.txt"]);
         assert_eq!(patch_result.hunks_applied, 1);
@@ -1739,6 +1845,17 @@ diff --git a/same.txt b/same.txt
             .expect("execute");
 
         assert!(result.success);
+        let mutation = &result.metadata.as_ref().expect("metadata")["mutation"];
+        assert_eq!(
+            mutation["files"],
+            json!([{ "path": "test.txt", "outcome": "updated" }])
+        );
+        assert!(
+            mutation["diff"]
+                .as_str()
+                .is_some_and(|diff| diff.contains("+line2")),
+            "{mutation}"
+        );
         let patch_result = parse_patch_result(result);
         assert_eq!(patch_result.touched_files, vec!["test.txt"]);
 
@@ -1767,6 +1884,17 @@ diff --git a/same.txt b/same.txt
             .expect("execute");
 
         assert!(result.success);
+        let mutation = &result.metadata.as_ref().expect("metadata")["mutation"];
+        assert_eq!(
+            mutation["files"],
+            json!([{ "path": "new_file.txt", "outcome": "created" }])
+        );
+        assert!(
+            mutation["diff"]
+                .as_str()
+                .is_some_and(|diff| diff.contains("+line1")),
+            "{mutation}"
+        );
         let patch_result = parse_patch_result(result);
         assert_eq!(patch_result.touched_files, vec!["new_file.txt"]);
         assert!(patch_result.file_summaries.first().unwrap().created);
@@ -1801,6 +1929,20 @@ diff --git a/same.txt b/same.txt
         assert_eq!(metadata["files_total"], 2);
         assert_eq!(metadata["hunks_total"], 0);
         assert!(metadata.get("path_override").is_none());
+        assert_eq!(
+            metadata["mutation"]["files"],
+            json!([
+                { "path": "one.txt", "outcome": "updated" },
+                { "path": "two.txt", "outcome": "created" }
+            ])
+        );
+        let mutation_diff = metadata["mutation"]["diff"]
+            .as_str()
+            .expect("mutation diff");
+        assert!(mutation_diff.contains("diff --git a/one.txt b/one.txt"));
+        assert!(mutation_diff.contains("diff --git a/two.txt b/two.txt"));
+        assert!(mutation_diff.contains("--- a/one.txt"), "{mutation_diff}");
+        assert!(mutation_diff.contains("+++ b/two.txt"), "{mutation_diff}");
         let patch_result = parse_patch_result(result);
         let mut touched = patch_result.touched_files.clone();
         touched.sort();
@@ -1966,6 +2108,79 @@ diff --git a/b.txt b/b.txt
         let b = fs::read_to_string(tmp.path().join("b.txt")).unwrap();
         assert!(a.contains("line2-mod"));
         assert!(b.contains("beta2"));
+    }
+
+    #[tokio::test]
+    async fn mutation_receipt_covers_delete_rename_and_multifile_outcomes() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        fs::write(tmp.path().join("old.txt"), "same\n").expect("old");
+        fs::write(tmp.path().join("update.txt"), "before\n").expect("update");
+        fs::write(tmp.path().join("delete.txt"), "gone\n").expect("delete");
+
+        let patch = r"diff --git a/old.txt b/old.txt
+--- a/old.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-same
+diff --git a/new.txt b/new.txt
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1 @@
++same
+diff --git a/update.txt b/update.txt
+--- a/update.txt
++++ b/update.txt
+@@ -1 +1 @@
+-before
++after
+diff --git a/create.txt b/create.txt
+--- /dev/null
++++ b/create.txt
+@@ -0,0 +1 @@
++fresh
+diff --git a/delete.txt b/delete.txt
+--- a/delete.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-gone
+";
+
+        let result = ApplyPatchTool
+            .execute(json!({"patch": patch}), &ctx)
+            .await
+            .expect("execute");
+        let mutation = &result.metadata.as_ref().expect("metadata")["mutation"];
+        assert_eq!(
+            mutation["files"],
+            json!([
+                { "path": "update.txt", "outcome": "updated" },
+                { "path": "create.txt", "outcome": "created" },
+                { "path": "delete.txt", "outcome": "deleted" }
+            ])
+        );
+        assert_eq!(
+            mutation["renames"],
+            json!([{ "from": "old.txt", "to": "new.txt" }])
+        );
+        let exact = mutation["diff"].as_str().expect("exact mutation diff");
+        assert!(exact.contains("rename from old.txt"), "{exact}");
+        assert!(exact.contains("rename to new.txt"), "{exact}");
+        assert!(exact.contains("--- a/update.txt"), "{exact}");
+        assert!(exact.contains("+++ b/create.txt"), "{exact}");
+        assert!(exact.contains("--- a/delete.txt"), "{exact}");
+
+        assert!(!tmp.path().join("old.txt").exists());
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("new.txt")).expect("renamed target"),
+            "same\n"
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("update.txt")).expect("updated"),
+            "after\n"
+        );
+        assert!(tmp.path().join("create.txt").exists());
+        assert!(!tmp.path().join("delete.txt").exists());
     }
 
     #[tokio::test]

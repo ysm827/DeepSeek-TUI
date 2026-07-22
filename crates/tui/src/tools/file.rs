@@ -768,7 +768,18 @@ impl ToolSpec for WriteFileTool {
             format!("{body}\n{diag_block}")
         };
 
-        Ok(ToolResult::success(full_body))
+        let outcome = if existed_before { "updated" } else { "created" };
+        // Keep the execution-owned receipt workspace-relative even though the
+        // legacy model-facing output above retains its resolved-path wording.
+        let receipt_diff = make_unified_diff(path_str, &prior_contents, file_content);
+        Ok(ToolResult::success(full_body).with_metadata(json!({
+            "event": "file.mutation",
+            "mutation": {
+                "diff": receipt_diff,
+                "files": [{ "path": path_str, "outcome": outcome }],
+                "renames": []
+            }
+        })))
     }
 }
 
@@ -933,7 +944,17 @@ impl ToolSpec for EditFileTool {
             format!("{body}\n{diag_block}")
         };
 
-        Ok(ToolResult::success(full_body))
+        // The structured receipt uses the requested workspace path instead of
+        // the resolved host path retained by the legacy model-facing body.
+        let receipt_diff = make_unified_diff(path_str, &contents, &updated);
+        Ok(ToolResult::success(full_body).with_metadata(json!({
+            "event": "file.mutation",
+            "mutation": {
+                "diff": receipt_diff,
+                "files": [{ "path": path_str, "outcome": "updated" }],
+                "renames": []
+            }
+        })))
     }
 }
 
@@ -1919,6 +1940,24 @@ mod tests {
             "{}",
             result.content
         );
+        let mutation = &result.metadata.as_ref().expect("metadata")["mutation"];
+        assert_eq!(
+            mutation["files"],
+            json!([{ "path": "output.txt", "outcome": "created" }])
+        );
+        assert!(
+            mutation["diff"]
+                .as_str()
+                .is_some_and(|diff| diff.contains("--- a/output.txt")),
+            "{mutation}"
+        );
+        assert!(
+            !mutation["diff"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&tmp.path().display().to_string()),
+            "receipt headers must not expose the resolved host path: {mutation}"
+        );
 
         // Verify file was written
         let written = fs::read_to_string(tmp.path().join("output.txt")).expect("read");
@@ -2063,6 +2102,19 @@ mod tests {
             result.content
         );
         assert!(result.content.contains("+hi world"), "{}", result.content);
+        let mutation = &result.metadata.as_ref().expect("metadata")["mutation"];
+        assert_eq!(
+            mutation["files"],
+            json!([{ "path": "edit_me.txt", "outcome": "updated" }])
+        );
+        let receipt_diff = mutation["diff"].as_str().expect("receipt diff");
+        assert!(receipt_diff.contains("--- a/edit_me.txt"), "{receipt_diff}");
+        assert!(receipt_diff.contains("-hello world"), "{receipt_diff}");
+        assert!(receipt_diff.contains("+hi world"), "{receipt_diff}");
+        assert!(
+            !receipt_diff.contains(&tmp.path().display().to_string()),
+            "receipt headers must not expose the resolved host path: {receipt_diff}"
+        );
 
         // Verify edit was applied
         let edited = fs::read_to_string(&test_file).expect("read");
