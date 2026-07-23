@@ -464,94 +464,7 @@ impl DeepSeekClient {
             self.path_suffix.as_deref(),
             &body,
         );
-        // Shared open-path seam (policy + idle envelope + H1 twin selection).
-        let open_timeout = stream_open_timeout();
-        let open_req = super::stream_entry::StreamOpenRequest::new(
-            open_timeout,
-            self.stream_idle_timeout,
-        );
-        let open_client = super::stream_entry::client_for_policy(
-            &self.http_client,
-            self.http1_fallback_client(),
-            open_req.policy,
-        );
-        let response = match tokio_timeout(
-            open_req.open_timeout,
-            // When policy is already Http1Only the twin is the open client;
-            // Dual still uses the primary path (retry-capable) via send_json.
-            if matches!(
-                open_req.policy,
-                super::stream_entry::StreamHttpPolicy::Http1Only
-            ) {
-                open_client
-                    .post(&url)
-                    .header(reqwest::header::CONTENT_TYPE, "application/json")
-                    .json(&body)
-                    .send()
-            } else {
-                self.send_json_with_retry(&url, &body)
-            },
-        )
-        .await
-        {
-            Ok(result) => result?,
-            Err(_elapsed) => {
-                // Automatic HTTP/1.1 fallback when H2 fails to deliver stream
-                // headers within the open timeout. The HTTP/1.1 twin is built
-                // at client construction so Chat Completions, Anthropic, and
-                // Responses can share the same recovery path.
-                // Treat header stall as a transport failure eligible for H1 retry.
-                if super::stream_entry::should_retry_with_h1(
-                    open_req.policy,
-                    "http2 stream closed",
-                ) {
-                    let h1_req = open_req.with_h1_only();
-                    let h1_client = super::stream_entry::client_for_policy(
-                        &self.http_client,
-                        self.http1_fallback_client(),
-                        h1_req.policy,
-                    );
-                    crate::logging::warn(
-                        "SSE stream headers timed out over HTTP/2; retrying once with HTTP/1.1",
-                    );
-                    let retry = tokio_timeout(
-                        h1_req.open_timeout,
-                        h1_client
-                            .post(&url)
-                            .header(reqwest::header::CONTENT_TYPE, "application/json")
-                            .json(&body)
-                            .send(),
-                    )
-                    .await;
-                    match retry {
-                        Ok(Ok(resp)) => resp,
-                        Ok(Err(err)) => {
-                            anyhow::bail!(
-                                "SSE stream request failed after HTTP/1.1 fallback: {err}. \
-                                 `codewhale doctor` can still pass when non-streaming requests work; \
-                                 on Windows or proxy networks, try `CODEWHALE_FORCE_HTTP1=1` and rerun `codewhale`."
-                            );
-                        }
-                        Err(_elapsed) => {
-                            anyhow::bail!(
-                                "SSE stream request did not receive response headers after {}s \
-                                 (HTTP/2 and HTTP/1.1). `codewhale doctor` can still pass when \
-                                 non-streaming requests work; try `CODEWHALE_FORCE_HTTP1=1` and \
-                                 rerun `codewhale`.",
-                                open_timeout.as_secs()
-                            );
-                        }
-                    }
-                } else {
-                    anyhow::bail!(
-                        "SSE stream request did not receive response headers after {}s. \
-                         `codewhale doctor` can still pass when non-streaming requests work; \
-                         on Windows or proxy networks, try `CODEWHALE_FORCE_HTTP1=1` and rerun `codewhale`.",
-                        open_timeout.as_secs()
-                    );
-                }
-            }
-        };
+        let response = self.send_json_with_retry(&url, &body).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -579,6 +492,93 @@ impl DeepSeekClient {
 }
 
 impl DeepSeekClient {
+    async fn open_chat_stream_response(
+        &self,
+        url: &str,
+        body: &Value,
+    ) -> Result<(reqwest::Response, Duration)> {
+        let open_timeout = stream_open_timeout();
+        let open_req =
+            super::stream_entry::StreamOpenRequest::new(open_timeout, self.stream_idle_timeout);
+        let idle_timeout = open_req.idle_timeout;
+        let open_client = super::stream_entry::client_for_policy(
+            &self.http_client,
+            self.http1_fallback_client(),
+            open_req.policy,
+        );
+        let response = match tokio_timeout(open_req.open_timeout, async {
+            if matches!(
+                open_req.policy,
+                super::stream_entry::StreamHttpPolicy::Http1Only
+            ) {
+                Ok(open_client
+                    .post(url)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .json(body)
+                    .send()
+                    .await?)
+            } else {
+                self.send_json_with_retry(url, body).await
+            }
+        })
+        .await
+        {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                // A header stall on the dual client is eligible for one
+                // explicit retry through the prebuilt HTTP/1.1 twin.
+                if super::stream_entry::should_retry_with_h1(open_req.policy, "http2 stream closed")
+                {
+                    let h1_req = open_req.with_h1_only();
+                    let h1_client = super::stream_entry::client_for_policy(
+                        &self.http_client,
+                        self.http1_fallback_client(),
+                        h1_req.policy,
+                    );
+                    crate::logging::warn(
+                        "SSE stream headers timed out over HTTP/2; retrying once with HTTP/1.1",
+                    );
+                    match tokio_timeout(
+                        h1_req.open_timeout,
+                        h1_client
+                            .post(url)
+                            .header(reqwest::header::CONTENT_TYPE, "application/json")
+                            .json(body)
+                            .send(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(response)) => response,
+                        Ok(Err(err)) => {
+                            anyhow::bail!(
+                                "SSE stream request failed after HTTP/1.1 fallback: {err}. \
+                                 `codewhale doctor` can still pass when non-streaming requests work; \
+                                 on Windows or proxy networks, try `CODEWHALE_FORCE_HTTP1=1` and rerun `codewhale`."
+                            );
+                        }
+                        Err(_elapsed) => {
+                            anyhow::bail!(
+                                "SSE stream request did not receive response headers after {}s \
+                                 (HTTP/2 and HTTP/1.1). `codewhale doctor` can still pass when \
+                                 non-streaming requests work; try `CODEWHALE_FORCE_HTTP1=1` and \
+                                 rerun `codewhale`.",
+                                open_timeout.as_secs()
+                            );
+                        }
+                    }
+                } else {
+                    anyhow::bail!(
+                        "SSE stream request did not receive response headers after {}s. \
+                         `codewhale doctor` can still pass when non-streaming requests work; \
+                         on Windows or proxy networks, try `CODEWHALE_FORCE_HTTP1=1` and rerun `codewhale`.",
+                        open_timeout.as_secs()
+                    );
+                }
+            }
+        };
+        Ok((response, idle_timeout))
+    }
+
     pub(super) async fn handle_chat_completion_stream(
         &self,
         request: MessageRequest,
@@ -696,7 +696,7 @@ impl DeepSeekClient {
             self.path_suffix.as_deref(),
             &body,
         );
-        let response = self.send_json_with_retry(&url, &body).await?;
+        let (response, stream_idle_timeout) = self.open_chat_stream_response(&url, &body).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -724,7 +724,6 @@ impl DeepSeekClient {
         // gzip-compressor failure when investigating #103.
         let response_headers = format_stream_headers(response.headers());
         let byte_stream = response.bytes_stream();
-        let stream_idle_timeout = self.stream_idle_timeout;
         let configured_reasoning_stream_style = self.reasoning_stream_style.clone();
 
         let stream = async_stream::stream! {
