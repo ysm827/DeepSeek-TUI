@@ -3076,9 +3076,13 @@ fn phase_marker_for_label(frame: &qa_harness::Frame, label: &str) -> char {
         .rev()
         .find(|&row| frame.row(row).contains(label))
         .unwrap_or_else(|| panic!("phase {label:?} missing:\n{}", frame.debug_dump()));
-    frame
-        .row(row)
+    let row_text = frame.row(row);
+    let label_start = row_text
+        .find(label)
+        .expect("matched phase row should still contain its label");
+    row_text[..label_start]
         .chars()
+        .rev()
         .find(|ch| !ch.is_whitespace())
         .expect("phase row should contain a marker")
 }
