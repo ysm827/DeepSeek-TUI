@@ -3845,7 +3845,7 @@ fn test_parse_spawn_request_rejects_conflicting_type_and_role() {
     let err = parse_spawn_request(&input).expect_err("conflicting type+role should fail");
     assert!(
         err.to_string()
-            .contains("Conflicting type/agent_type and role/agent_role")
+            .contains("Fleet role conflicts with the explicit legacy agent type")
     );
 }
 

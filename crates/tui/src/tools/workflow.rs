@@ -4378,7 +4378,8 @@ workflow({
         assert!(
             conflicting_payload["error"]
                 .as_str()
-                .is_some_and(|error| error.contains("conflicting explicit type")),
+                .is_some_and(|error| error
+                    .contains("Fleet role conflicts with the explicit legacy agent type")),
             "{conflicting_payload}"
         );
         assert_eq!(

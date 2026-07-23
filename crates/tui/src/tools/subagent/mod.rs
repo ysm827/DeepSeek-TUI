@@ -9369,7 +9369,7 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         && type_kind != role_kind
     {
         return Err(ToolError::invalid_input(
-            "Conflicting type/agent_type and role/agent_role values".to_string(),
+            "Fleet role conflicts with the explicit legacy agent type".to_string(),
         ));
     }
 
