@@ -38,9 +38,11 @@ pub fn emit_build_version(manifest_dir: &Path, package_version: &str) {
 /// `git commit` on the current branch updates the underlying ref file
 /// (loose `refs/heads/<name>`, or `packed-refs` after `git pack-refs`)
 /// without touching `HEAD` itself. So when `HEAD` is a symbolic ref we
-/// also watch the resolved target and `packed-refs`. A non-existent
-/// `rerun-if-changed` path is treated as "always changed" by Cargo, which
-/// covers the loose→packed transition.
+/// also watch the resolved target and `packed-refs`. Linked worktrees keep
+/// `HEAD` in a private gitdir but store branch refs in the shared common gitdir,
+/// so the symbolic target must be watched from that common directory. A
+/// non-existent `rerun-if-changed` path is treated as "always changed" by
+/// Cargo, which covers the loose→packed transition.
 fn declare_git_head_rerun(manifest_dir: &Path) {
     let workspace_root = manifest_dir.join("..").join("..");
     let git_meta = workspace_root.join(".git");
@@ -72,11 +74,35 @@ fn declare_git_head_rerun(manifest_dir: &Path) {
     if let Ok(contents) = std::fs::read_to_string(&head)
         && let Some(target) = parse_symbolic_ref(&contents)
     {
-        println!("cargo:rerun-if-changed={}", gitdir.join(target).display());
+        let common_gitdir = git_common_dir(&gitdir);
         println!(
             "cargo:rerun-if-changed={}",
-            gitdir.join("packed-refs").display()
+            common_gitdir.join(target).display()
         );
+        println!(
+            "cargo:rerun-if-changed={}",
+            common_gitdir.join("packed-refs").display()
+        );
+    }
+}
+
+/// Resolve the shared ref store for a normal repository or a linked worktree.
+/// Git writes `commondir` in a linked worktree's private gitdir; its value is
+/// relative to that directory unless Git supplied an absolute path.
+fn git_common_dir(gitdir: &Path) -> PathBuf {
+    let commondir = gitdir.join("commondir");
+    let Ok(contents) = std::fs::read_to_string(commondir) else {
+        return gitdir.to_path_buf();
+    };
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        return gitdir.to_path_buf();
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        gitdir.join(path)
     }
 }
 
@@ -139,7 +165,11 @@ fn short_sha(value: String) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_symbolic_ref;
+    use super::{git_common_dir, parse_symbolic_ref};
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn symbolic_ref_strips_prefix_and_whitespace() {
@@ -169,5 +199,28 @@ mod tests {
     fn empty_input_returns_none() {
         assert_eq!(parse_symbolic_ref(""), None);
         assert_eq!(parse_symbolic_ref("ref: \n"), None);
+    }
+
+    #[test]
+    fn linked_worktree_uses_the_common_ref_store() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "codewhale-build-support-{}-{unique}",
+            std::process::id()
+        ));
+        let common = root.join(".git");
+        let worktree_gitdir = common.join("worktrees/candidate");
+        fs::create_dir_all(&worktree_gitdir).expect("create worktree gitdir");
+        fs::write(worktree_gitdir.join("commondir"), "../..\n").expect("write commondir");
+
+        assert_eq!(
+            fs::canonicalize(git_common_dir(&worktree_gitdir)).expect("canonical common gitdir"),
+            fs::canonicalize(&common).expect("canonical expected gitdir")
+        );
+
+        fs::remove_dir_all(root).expect("remove isolated test directory");
     }
 }
