@@ -439,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn todos_share_one_ordered_work_projection_without_a_second_heading() {
+    fn todos_share_one_canonical_work_projection_without_a_second_heading() {
         let mut app = app();
         {
             let mut todos = app.todos.try_lock().expect("todos");
@@ -461,7 +461,7 @@ mod tests {
                 .skip(1)
                 .map(|row| row.label.as_str())
                 .collect::<Vec<_>>(),
-            ["current", "next", "finished"]
+            ["finished", "current", "next"]
         );
     }
 
