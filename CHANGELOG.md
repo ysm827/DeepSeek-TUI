@@ -20,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Consolidate Anthropic Messages and OpenAI Responses stream opening
+  through the shared `client/stream_entry.rs` transport seam already used
+  by Chat Completions: one bounded response-header wait, shared
+  dual/HTTP-1.1 client policy selection, at most one HTTP/1.1 fallback
+  retry on a classified HTTP/2 header stall (never after a stream body
+  has begun), and the shared idle-timeout diagnostics format. Both
+  adapters gain the bounded open wait and `CODEWHALE_FORCE_HTTP1`
+  H1 pinning; wire-specific headers, authentication, endpoints, and
+  stream decoding stay at the adapter edge, and the Responses provider
+  retry loop for rate limits / transient upstream errors is preserved.
 - Rename the internal delegated-worker role type from `SubAgentType` to
   `FleetRole` with canonical variants (`Worker`, `Scout`, `Planner`,
   `Reviewer`, `Builder`, `Verifier`, `Custom`) matching the public Fleet

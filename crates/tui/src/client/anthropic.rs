@@ -180,7 +180,15 @@ impl DeepSeekClient {
             .send()
             .await
             .context("Anthropic Messages API request failed")?;
+        self.check_anthropic_response(response).await
+    }
 
+    /// Shared status/error-envelope handling for streaming and
+    /// non-streaming Messages responses.
+    async fn check_anthropic_response(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<reqwest::Response> {
         let status = response.status();
         if !status.is_success() {
             let raw = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
@@ -193,13 +201,54 @@ impl DeepSeekClient {
         Ok(response)
     }
 
+    /// Open the streaming Messages request through the shared stream-entry
+    /// transport policy: bounded header wait, dual-client selection, and at
+    /// most one HTTP/1.1 fallback retry on a classified H2 header stall.
+    /// Wire-specific request construction (headers, endpoint, body) stays
+    /// here at the adapter edge.
+    async fn open_anthropic_stream_response(&self, body: &Value) -> Result<reqwest::Response> {
+        let url = anthropic_messages_url(&self.base_url);
+        let open_req = super::stream_entry::StreamOpenRequest::new(
+            super::stream_entry::stream_open_timeout(),
+            self.stream_idle_timeout,
+        );
+        let opened = super::stream_entry::open_sse_response(&open_req, |policy| {
+            let url = url.clone();
+            async move {
+                self.wait_for_rate_limit().await;
+                let client = super::stream_entry::client_for_policy(
+                    &self.http_client,
+                    self.http1_fallback_client(),
+                    policy,
+                );
+                client
+                    .post(&url)
+                    .header("Accept", "text/event-stream")
+                    .json(body)
+                    .send()
+                    .await
+                    .context("Anthropic Messages API request failed")
+            }
+        })
+        .await;
+        let response = match opened {
+            Ok(response) => response,
+            Err(err) => {
+                self.mark_request_failure(&format!("anthropic stream open: {err}"))
+                    .await;
+                return Err(err);
+            }
+        };
+        self.check_anthropic_response(response).await
+    }
+
     /// Handle a streaming Messages API request.
     pub(super) async fn handle_anthropic_stream(
         &self,
         request: MessageRequest,
     ) -> Result<StreamEventBox> {
         let body = self.build_anthropic_body(&request, true);
-        let response = self.send_anthropic_request(&body).await?;
+        let response = self.open_anthropic_stream_response(&body).await?;
 
         let stream_idle_timeout = self.stream_idle_timeout;
         let byte_stream = response.bytes_stream();
@@ -212,6 +261,9 @@ impl DeepSeekClient {
             // corrupted to U+FFFD. Line boundaries ('\n') are ASCII and can
             // never fall inside a multi-byte sequence. (Mirrors chat.rs.)
             let mut buffer: Vec<u8> = Vec::new();
+            let stream_start = std::time::Instant::now();
+            let mut last_chunk_at = std::time::Instant::now();
+            let mut bytes_received: usize = 0;
             tokio::pin!(byte_stream);
 
             loop {
@@ -223,11 +275,18 @@ impl DeepSeekClient {
                     }
                     Ok(None) => break,
                     Err(_) => {
-                        yield Err(anyhow::anyhow!("Stream idle timeout"));
+                        yield Err(anyhow::anyhow!(super::stream_entry::idle_timeout_message(
+                            stream_idle_timeout,
+                            bytes_received,
+                            stream_start.elapsed(),
+                            last_chunk_at.elapsed(),
+                        )));
                         return;
                     }
                 };
 
+                bytes_received += chunk.len();
+                last_chunk_at = std::time::Instant::now();
                 buffer.extend_from_slice(&chunk);
 
                 while let Some(line) = super::take_sse_line(&mut buffer) {
@@ -1166,6 +1225,78 @@ mod tests {
         assert_eq!(
             anthropic_messages_url("https://api.minimaxi.com/anthropic"),
             "https://api.minimaxi.com/anthropic/v1/messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_opens_through_shared_seam_preserving_headers() {
+        use futures_util::StreamExt;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // The wire-specific Accept header must survive the shared stream-entry
+        // open path; the mock only answers when it is present.
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("Accept", "text/event-stream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .set_body_string("data: {\"type\":\"message_stop\"}\n\n"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = deepseek_test_client(&server.uri());
+        let mut stream = client
+            .handle_anthropic_stream(request_with("deepseek-v4", None, None, None))
+            .await
+            .expect("stream opens through the shared seam");
+
+        let mut saw_stop = false;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::MessageStop) {
+                    saw_stop = true;
+                }
+            }
+        })
+        .await
+        .expect("stream finishes after message_stop");
+        assert!(saw_stop, "message_stop should arrive through the seam");
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_open_error_is_not_retried() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // A definitive provider error before any stream body must fail fast:
+        // exactly one request, no H1 fallback, envelope preserved.
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(
+                "{\"error\":{\"type\":\"authentication_error\",\"message\":\"bad key\"}}",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = deepseek_test_client(&server.uri());
+        let err = match client
+            .handle_anthropic_stream(request_with("deepseek-v4", None, None, None))
+            .await
+        {
+            Ok(_) => panic!("auth errors must fail fast"),
+            Err(err) => err,
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("HTTP 401") && text.contains("authentication_error"),
+            "error envelope should be preserved: {text}"
         );
     }
 }

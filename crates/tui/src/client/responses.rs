@@ -86,29 +86,50 @@ impl DeepSeekClient {
         let url = format!("{}{}", self.base_url, CODEX_RESPONSES_PATH);
 
         // The bearer Authorization header is already installed as a default
-        // header on `http_client` (resolved from the Codex OAuth access token),
-        // so it must not be set again here or it would be duplicated. The
-        // ChatGPT backend additionally requires the account id and the
-        // experimental Responses beta opt-in.
+        // header on both the dual and the HTTP/1.1 twin client (resolved from
+        // the Codex OAuth access token), so it must not be set again here or
+        // it would be duplicated. The ChatGPT backend additionally requires
+        // the account id and the experimental Responses beta opt-in.
+        //
+        // The open itself goes through the shared stream-entry transport
+        // policy: bounded header wait, policy-selected client, and at most
+        // one HTTP/1.1 fallback retry on a classified H2 header stall. The
+        // pre-existing provider retry loop (rate limit / transient upstream)
+        // stays inside each open attempt, before any stream body exists.
         let account_id = self.codex_account_id.clone();
         let request_body =
             serde_json::to_vec(&body).context("Failed to serialize Responses API request body")?;
-        let response = self
-            .send_with_retry(|| {
-                let mut builder = self
-                    .http_client
-                    .post(&url)
-                    .header("Content-Type", "application/json")
-                    .header("Accept", "text/event-stream")
-                    .header("OpenAI-Beta", "responses=experimental")
-                    .header("originator", "codex_cli_rs");
-                if let Some(account_id) = &account_id {
-                    builder = builder.header("chatgpt-account-id", account_id);
-                }
-                builder.body(request_body.clone())
-            })
-            .await
-            .context("Responses API request failed")?;
+        let open_req = super::stream_entry::StreamOpenRequest::new(
+            super::stream_entry::stream_open_timeout(),
+            self.stream_idle_timeout,
+        );
+        let response = super::stream_entry::open_sse_response(&open_req, |policy| {
+            let url = url.clone();
+            let account_id = account_id.clone();
+            let request_body = request_body.clone();
+            async move {
+                let client = super::stream_entry::client_for_policy(
+                    &self.http_client,
+                    self.http1_fallback_client(),
+                    policy,
+                );
+                self.send_with_retry(|| {
+                    let mut builder = client
+                        .post(&url)
+                        .header("Content-Type", "application/json")
+                        .header("Accept", "text/event-stream")
+                        .header("OpenAI-Beta", "responses=experimental")
+                        .header("originator", "codex_cli_rs");
+                    if let Some(account_id) = &account_id {
+                        builder = builder.header("chatgpt-account-id", account_id);
+                    }
+                    builder.body(request_body.clone())
+                })
+                .await
+                .context("Responses API request failed")
+            }
+        })
+        .await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -151,6 +172,9 @@ impl DeepSeekClient {
             let mut buffer: Vec<u8> = Vec::new();
             let mut done = false;
             let mut content_block_counter: u32 = 0;
+            let stream_start = std::time::Instant::now();
+            let mut last_chunk_at = std::time::Instant::now();
+            let mut bytes_received: usize = 0;
 
             tokio::pin!(byte_stream);
 
@@ -163,11 +187,18 @@ impl DeepSeekClient {
                     }
                     Ok(None) => break,
                     Err(_) => {
-                        yield Err(anyhow::anyhow!("Stream idle timeout"));
+                        yield Err(anyhow::anyhow!(super::stream_entry::idle_timeout_message(
+                            stream_idle_timeout,
+                            bytes_received,
+                            stream_start.elapsed(),
+                            last_chunk_at.elapsed(),
+                        )));
                         return;
                     }
                 };
 
+                bytes_received += chunk.len();
+                last_chunk_at = std::time::Instant::now();
                 buffer.extend_from_slice(&chunk);
 
                 // Process complete SSE lines.
@@ -961,6 +992,52 @@ mod tests {
             err.downcast_ref::<crate::llm_client::LlmError>().is_some(),
             "LlmError should survive the anyhow chain"
         );
+    }
+
+    #[tokio::test]
+    async fn responses_stream_open_preserves_wire_headers_through_shared_seam() {
+        use wiremock::matchers::header;
+
+        let server = MockServer::start().await;
+        // Every wire-specific header (SSE accept, Responses beta opt-in,
+        // originator, bearer auth from the default headers) must survive the
+        // shared stream-entry open path; the mock only answers when all are
+        // present.
+        Mock::given(method("POST"))
+            .and(path(CODEX_RESPONSES_PATH))
+            .and(header("Accept", "text/event-stream"))
+            .and(header("OpenAI-Beta", "responses=experimental"))
+            .and(header("originator", "codex_cli_rs"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .set_body_string("data: [DONE]\n\n"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = {
+            let _env_lock = crate::test_support::lock_test_env();
+            let _codex_token =
+                crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
+            let _legacy_codex_token =
+                crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+            DeepSeekClient::new(&test_codex_config(&server)).unwrap()
+        };
+        let mut stream = client
+            .handle_responses_stream(minimal_responses_request())
+            .await
+            .expect("stream opens with preserved headers");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(event) = stream.next().await {
+                event.unwrap();
+            }
+        })
+        .await
+        .expect("stream should finish after [DONE]");
     }
 
     #[tokio::test]

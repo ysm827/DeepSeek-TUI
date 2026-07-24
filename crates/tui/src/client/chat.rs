@@ -19,34 +19,10 @@ use crate::config::{
     wire_model_for_provider_route,
 };
 
-/// Default timeout for the initial streaming response headers.
-///
-/// `doctor` uses a bounded non-streaming request, but normal TUI turns first
-/// wait for the SSE response to open. On some Windows/proxy paths that wait can
-/// hang before any stream chunk exists, leaving the UI stuck at "Working...".
-const DEFAULT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(45);
-
-/// Reads `CODEWHALE_STREAM_OPEN_TIMEOUT_SECS` (legacy alias:
-/// `DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS`) as a bounded override for the
-/// response-header wait. This is intentionally shorter than the per-chunk idle
-/// timeout because it only covers connection setup and upstream header return,
-/// not model thinking time after streaming has started.
-fn stream_open_timeout() -> Duration {
-    stream_open_timeout_from_env(
-        std::env::var("CODEWHALE_STREAM_OPEN_TIMEOUT_SECS")
-            .or_else(|_| std::env::var("DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS"))
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn stream_open_timeout_from_env(value: Option<&str>) -> Duration {
-    let secs = value
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_STREAM_OPEN_TIMEOUT.as_secs())
-        .clamp(5, 300);
-    Duration::from_secs(secs)
-}
+// The bounded response-header wait (`stream_open_timeout`) and its env
+// override live in the shared stream-entry seam; every streaming adapter
+// (Chat Completions / Anthropic Messages / Responses) uses the same policy.
+use super::stream_entry::stream_open_timeout;
 
 fn stream_idle_timeout_message(
     idle: Duration,
@@ -497,85 +473,35 @@ impl DeepSeekClient {
         url: &str,
         body: &Value,
     ) -> Result<(reqwest::Response, Duration)> {
-        let open_timeout = stream_open_timeout();
-        let open_req =
-            super::stream_entry::StreamOpenRequest::new(open_timeout, self.stream_idle_timeout);
-        let idle_timeout = open_req.idle_timeout;
-        let open_client = super::stream_entry::client_for_policy(
-            &self.http_client,
-            self.http1_fallback_client(),
-            open_req.policy,
+        let open_req = super::stream_entry::StreamOpenRequest::new(
+            stream_open_timeout(),
+            self.stream_idle_timeout,
         );
-        let response = match tokio_timeout(open_req.open_timeout, async {
-            if matches!(
-                open_req.policy,
-                super::stream_entry::StreamHttpPolicy::Http1Only
-            ) {
-                Ok(open_client
-                    .post(url)
-                    .header(reqwest::header::CONTENT_TYPE, "application/json")
-                    .json(body)
-                    .send()
-                    .await?)
-            } else {
-                self.send_json_with_retry(url, body).await
-            }
-        })
-        .await
-        {
-            Ok(result) => result?,
-            Err(_elapsed) => {
-                // A header stall on the dual client is eligible for one
-                // explicit retry through the prebuilt HTTP/1.1 twin.
-                if super::stream_entry::should_retry_with_h1(open_req.policy, "http2 stream closed")
-                {
-                    let h1_req = open_req.with_h1_only();
-                    let h1_client = super::stream_entry::client_for_policy(
+        let idle_timeout = open_req.idle_timeout;
+        let response = super::stream_entry::open_sse_response(&open_req, |policy| async move {
+            match policy {
+                // The prebuilt HTTP/1.1 twin carries the same default
+                // headers/auth; send once, without the JSON retry loop
+                // (matching the pre-seam H1-pin behavior).
+                super::stream_entry::StreamHttpPolicy::Http1Only => {
+                    let client = super::stream_entry::client_for_policy(
                         &self.http_client,
                         self.http1_fallback_client(),
-                        h1_req.policy,
+                        policy,
                     );
-                    crate::logging::warn(
-                        "SSE stream headers timed out over HTTP/2; retrying once with HTTP/1.1",
-                    );
-                    match tokio_timeout(
-                        h1_req.open_timeout,
-                        h1_client
-                            .post(url)
-                            .header(reqwest::header::CONTENT_TYPE, "application/json")
-                            .json(body)
-                            .send(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(response)) => response,
-                        Ok(Err(err)) => {
-                            anyhow::bail!(
-                                "SSE stream request failed after HTTP/1.1 fallback: {err}. \
-                                 `codewhale doctor` can still pass when non-streaming requests work; \
-                                 on Windows or proxy networks, try `CODEWHALE_FORCE_HTTP1=1` and rerun `codewhale`."
-                            );
-                        }
-                        Err(_elapsed) => {
-                            anyhow::bail!(
-                                "SSE stream request did not receive response headers after {}s \
-                                 (HTTP/2 and HTTP/1.1). `codewhale doctor` can still pass when \
-                                 non-streaming requests work; try `CODEWHALE_FORCE_HTTP1=1` and \
-                                 rerun `codewhale`.",
-                                open_timeout.as_secs()
-                            );
-                        }
-                    }
-                } else {
-                    anyhow::bail!(
-                        "SSE stream request did not receive response headers after {}s. \
-                         `codewhale doctor` can still pass when non-streaming requests work; \
-                         on Windows or proxy networks, try `CODEWHALE_FORCE_HTTP1=1` and rerun `codewhale`.",
-                        open_timeout.as_secs()
-                    );
+                    Ok(client
+                        .post(url)
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .json(body)
+                        .send()
+                        .await?)
+                }
+                super::stream_entry::StreamHttpPolicy::DualWithH1Fallback => {
+                    self.send_json_with_retry(url, body).await
                 }
             }
-        };
+        })
+        .await?;
         Ok((response, idle_timeout))
     }
 
@@ -3302,27 +3228,6 @@ fn tool_name_or_fallback(name: Option<&str>, id: &str, source: &str) -> String {
 mod stream_diagnostics_tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue};
-
-    #[test]
-    fn stream_open_timeout_defaults_and_clamps_env_values() {
-        assert_eq!(stream_open_timeout_from_env(None), Duration::from_secs(45));
-        assert_eq!(
-            stream_open_timeout_from_env(Some("not-a-number")),
-            Duration::from_secs(45)
-        );
-        assert_eq!(
-            stream_open_timeout_from_env(Some("1")),
-            Duration::from_secs(5)
-        );
-        assert_eq!(
-            stream_open_timeout_from_env(Some("120")),
-            Duration::from_secs(120)
-        );
-        assert_eq!(
-            stream_open_timeout_from_env(Some("999")),
-            Duration::from_secs(300)
-        );
-    }
 
     #[test]
     fn stream_idle_timeout_reports_progress_and_timing() {

@@ -20,18 +20,33 @@ monoliths without necessity):
 Business logic must not land in `ui.rs` / `app.rs` / `widgets/mod.rs` unless it
 is pure view wiring.
 
-## StreamFn consolidation (partial)
+## StreamFn consolidation (landed post-0.9.1)
 
-`client/stream_entry.rs` is the shared open-path seam:
+`client/stream_entry.rs` is the shared open-path seam, and all three
+streaming adapters open through it:
 
-- HTTP policy (`DualWithH1Fallback` / `Http1Only`)
-- H1 retry classification
-- idle-timeout message format
+- HTTP policy (`DualWithH1Fallback` / `Http1Only`, env pin via
+  `CODEWHALE_FORCE_HTTP1`)
+- dual/H1-twin client selection (`client_for_policy`)
+- bounded response-header wait (`stream_open_timeout`, env override
+  `CODEWHALE_STREAM_OPEN_TIMEOUT_SECS`)
+- one shared open function (`open_sse_response`): a classified H2 header
+  stall on the dual client retries exactly once on the HTTP/1.1 twin;
+  an H1-pinned request never retries; nothing retries once response
+  headers (and therefore any stream body) exist
+- H1 retry classification (`should_retry_with_h1`)
+- idle-timeout message format (`idle_timeout_message`, with
+  bytes/age/last-chunk diagnostics)
 
-Wire-protocol adapters remain at the edge (`chat.rs`, `anthropic.rs`,
-`responses.rs`). Chat Completions now opens through `StreamOpenRequest`;
-**follow-up:** route the Anthropic Messages and Responses adapters through the
-same policy before collapsing further toward a piagent-style single StreamFn.
+Wire-protocol request construction and stream decoding remain at the
+adapter edge (`chat.rs`, `anthropic.rs`, `responses.rs`): each adapter
+builds its own endpoint URL, headers, auth, and body inside the attempt
+closure it hands to `open_sse_response`. The pre-existing Responses
+provider retry loop (rate limit / transient upstream, `send_with_retry`)
+stays inside each open attempt, before any stream body exists.
+
+Remaining follow-up: collapsing further toward a piagent-style single
+StreamFn (shared decode loop) is still deferred.
 
 ## Thin TUI over core (north star)
 
