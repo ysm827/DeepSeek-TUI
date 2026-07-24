@@ -4532,6 +4532,137 @@ fn implementer_catalog_inherits_patch_and_fim_when_enabled() {
     }
 }
 
+#[test]
+fn every_fleet_role_catalog_advertises_one_executable_load_skill() {
+    // load_skill contract (#4651): the parent Agent surface and every
+    // default Fleet role child keep first-class skill listing/loading, and
+    // read-only roles get it without gaining write or shell authority.
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    runtime.context.auto_approve = true;
+    let todo_list = crate::tools::todo::new_shared_todo_list();
+    let plan_state = crate::tools::plan::new_shared_plan_state();
+
+    let parent_registry = ToolRegistryBuilder::new()
+        .with_full_agent_surface_options(
+            Some(runtime.client.clone()),
+            runtime.model.clone(),
+            runtime.manager.clone(),
+            runtime.clone(),
+            runtime.agent_tool_surface_options.clone(),
+            todo_list.clone(),
+            plan_state.clone(),
+        )
+        .build(runtime.context.clone());
+    let parent_load_skills = parent_registry
+        .to_api_tools()
+        .into_iter()
+        .filter(|tool| tool.name == "load_skill")
+        .count();
+    assert_eq!(
+        parent_load_skills, 1,
+        "parent agent surface advertises exactly one load_skill"
+    );
+
+    for role in [
+        FleetRole::Worker,
+        FleetRole::Scout,
+        FleetRole::Planner,
+        FleetRole::Reviewer,
+        FleetRole::Builder,
+        FleetRole::Verifier,
+    ] {
+        let registry = SubAgentToolRegistry::new(
+            runtime.clone(),
+            role.clone(),
+            None,
+            todo_list.clone(),
+            plan_state.clone(),
+        );
+        let tools = registry.tools_for_model(&role);
+        let load_skills = tools
+            .iter()
+            .filter(|tool| tool.name == "load_skill")
+            .count();
+        assert_eq!(
+            load_skills, 1,
+            "Fleet role {role:?} must advertise exactly one load_skill"
+        );
+        assert!(
+            registry.is_tool_allowed("load_skill"),
+            "Fleet role {role:?} must be able to execute the advertised load_skill"
+        );
+
+        if matches!(
+            role,
+            FleetRole::Scout | FleetRole::Planner | FleetRole::Reviewer | FleetRole::Verifier
+        ) {
+            let names = tool_names(tools);
+            // All read-only roles keep load_skill without write authority.
+            for denied in ["write_file", "edit_file", "apply_patch", "fim_edit"] {
+                assert!(
+                    !names.contains(denied),
+                    "read-only role {role:?} keeps load_skill without gaining {denied}"
+                );
+            }
+            // Verifier intentionally keeps shell (it runs the test suite);
+            // the other read-only roles must not gain arbitrary shell.
+            if !matches!(role, FleetRole::Verifier) {
+                for denied in ["exec_shell", "task_shell_start", "Bash", "Run"] {
+                    assert!(
+                        !names.contains(denied),
+                        "read-only role {role:?} keeps load_skill without gaining {denied}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn custom_child_allowlist_omitting_load_skill_fails_closed() {
+    // Custom children get exactly their explicit allow-list: load_skill is
+    // never auto-injected, and listing it grants it.
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let todo_list = crate::tools::todo::new_shared_todo_list();
+    let plan_state = crate::tools::plan::new_shared_plan_state();
+
+    let without = SubAgentToolRegistry::new(
+        runtime.clone(),
+        FleetRole::Custom,
+        Some(vec!["read_file".to_string()]),
+        todo_list.clone(),
+        plan_state.clone(),
+    );
+    let names = tool_names(without.tools_for_model(&FleetRole::Custom));
+    assert!(
+        names.contains("File"),
+        "explicitly listed read_file surfaces as the unified File tool: {names:?}"
+    );
+    assert!(
+        !names.contains("load_skill"),
+        "load_skill must not be auto-injected into a custom allow-list: {names:?}"
+    );
+
+    let with = SubAgentToolRegistry::new(
+        runtime,
+        FleetRole::Custom,
+        Some(vec!["read_file".to_string(), "load_skill".to_string()]),
+        todo_list,
+        plan_state,
+    );
+    let names = tool_names(with.tools_for_model(&FleetRole::Custom));
+    assert!(
+        names.contains("load_skill"),
+        "explicitly listed load_skill is granted: {names:?}"
+    );
+}
+
 #[tokio::test]
 async fn plan_parent_profile_narrows_even_implementer_child_to_read_only() {
     let tmp = tempdir().expect("tempdir");

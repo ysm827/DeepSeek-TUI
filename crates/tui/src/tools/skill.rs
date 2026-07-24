@@ -467,6 +467,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_lists_available_skills_for_empty_star_and_list_names() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempdir().unwrap();
+        // Pin home-based global skill roots to the tempdir so host skills
+        // never leak into the listing count.
+        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path().join("home"));
+        let _cw_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cw-home"));
+        let workspace = tmp.path().to_path_buf();
+        let skills_dir = workspace.join(".codewhale").join("skills");
+        write_skill(&skills_dir, "alpha-skill", "First demo skill", "Body A.");
+        write_skill(&skills_dir, "beta-skill", "", "Body B.");
+
+        let context = ToolContext::new(workspace);
+        let tool = LoadSkillTool;
+
+        // #4651: listing is an action inside the single load_skill tool —
+        // empty name, "*", and "list" all enumerate the reviewed registry.
+        for listing_name in [json!({}), json!({"name": "*"}), json!({"name": "list"})] {
+            let result = tool
+                .execute(listing_name.clone(), &context)
+                .await
+                .expect("listing should succeed");
+            assert!(result.success);
+            assert!(
+                result.content.contains("Available skills (2)"),
+                "listing for {listing_name} should count skills: {}",
+                result.content
+            );
+            assert!(
+                result.content.contains("alpha-skill — First demo skill"),
+                "listing should include name and description: {}",
+                result.content
+            );
+            assert!(
+                result.content.contains("- beta-skill"),
+                "listing should include description-less skills: {}",
+                result.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_listing_reports_empty_registry_plainly() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempdir().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path().join("home"));
+        let _cw_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cw-home"));
+        let context = ToolContext::new(tmp.path().to_path_buf());
+        let result = LoadSkillTool
+            .execute(json!({"name": "list"}), &context)
+            .await
+            .expect("empty listing should still succeed");
+        assert!(result.success);
+        assert!(
+            result.content.contains("No skills installed."),
+            "{}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
     async fn execute_finds_skills_in_opencode_dir_via_workspace_discovery() {
         let tmp = tempdir().unwrap();
         let workspace = tmp.path().to_path_buf();

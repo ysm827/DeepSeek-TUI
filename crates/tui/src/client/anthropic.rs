@@ -1228,6 +1228,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn anthropic_body_serializes_exactly_one_load_skill_definition() {
+        // The real child catalog fixture (not a hand-built tool list) must
+        // survive Messages serialization with exactly one load_skill entry —
+        // no dedup, filter, or sanitizer may drop or duplicate it.
+        let tools = crate::tools::subagent::kimi_general_child_request_tools_fixture();
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|tool| tool.name == "load_skill")
+                .count(),
+            1,
+            "catalog fixture carries one load_skill"
+        );
+        let client = test_client();
+        let mut request = request_with("claude-sonnet-4-6", None, None, None);
+        request.tools = Some(tools);
+        let body = client.build_anthropic_body(&request, true);
+        let serialized = body["tools"]
+            .as_array()
+            .expect("tools serialize as an array");
+        let load_skills: Vec<_> = serialized
+            .iter()
+            .filter(|tool| tool["name"] == "load_skill")
+            .collect();
+        assert_eq!(
+            load_skills.len(),
+            1,
+            "exactly one load_skill definition reaches the Messages wire"
+        );
+        assert!(
+            load_skills[0]["input_schema"]["properties"].is_object(),
+            "load_skill keeps a valid object schema: {}",
+            load_skills[0]
+        );
+    }
+
     #[tokio::test]
     async fn anthropic_stream_opens_through_shared_seam_preserving_headers() {
         use futures_util::StreamExt;

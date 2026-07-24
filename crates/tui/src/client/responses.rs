@@ -994,6 +994,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn responses_body_serializes_exactly_one_load_skill_definition() {
+        // Mirror of the Anthropic contract: the real child catalog fixture
+        // maps 1:1 into Responses function tools with one load_skill entry.
+        let tools = crate::tools::subagent::kimi_general_child_request_tools_fixture();
+        let mut request = minimal_responses_request();
+        request.tools = Some(tools);
+        let body = build_responses_body(&request);
+        let serialized = body["tools"]
+            .as_array()
+            .expect("tools serialize as an array");
+        let load_skills: Vec<_> = serialized
+            .iter()
+            .filter(|tool| tool["name"] == "load_skill")
+            .collect();
+        assert_eq!(
+            load_skills.len(),
+            1,
+            "exactly one load_skill definition reaches the Responses wire"
+        );
+        assert!(
+            load_skills[0]["parameters"]["properties"].is_object(),
+            "load_skill keeps a valid parameters schema: {}",
+            load_skills[0]
+        );
+    }
+
     #[tokio::test]
     async fn responses_stream_open_preserves_wire_headers_through_shared_seam() {
         use wiremock::matchers::header;
